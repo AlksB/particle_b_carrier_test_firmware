@@ -19,32 +19,59 @@ SYSTEM_MODE(AUTOMATIC);
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 const pin_t REED_PIN = D23;
-const unsigned long DEBOUNCE_MS = 50;
 const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
+const unsigned long SCAN_RETRY_INTERVAL_MS = 10UL * 60 * 1000; // 10 minutes
 
-// Debounced reed switch read: only reports a new state once it has been
-// stable for DEBOUNCE_MS, to filter out mechanical contact bounce.
-bool readReedDebounced() {
-  static bool stableState = digitalRead(REED_PIN);
-  static bool lastRaw = stableState;
-  static unsigned long lastChangeTime = 0;
+const pin_t VBAT_MEAS_PIN = A0;
+const float ADC_REF_VOLTAGE = 3.3f;
+const float ADC_MAX_COUNTS = 4095.0f;
+// Divider R7=470k (VBAT to VBAT_MEAS) / R8=1000k (VBAT_MEAS to GND):
+// VBAT_MEAS = VBAT * R8/(R7+R8), so VBAT = VBAT_MEAS * (R7+R8)/R8
+const float VBAT_DIVIDER_RATIO = (470.0f + 1000.0f) / 1000.0f;
 
-  bool raw = digitalRead(REED_PIN);
-  if (raw != lastRaw) {
-    lastRaw = raw;
-    lastChangeTime = millis();
-  }
-  if (raw == lastRaw && (millis() - lastChangeTime) > DEBOUNCE_MS) {
-    stableState = lastRaw;
-  }
-  return stableState;
+static float readBatteryVoltage() {
+  float adcVoltage = (analogRead(VBAT_MEAS_PIN) / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
+  return adcVoltage * VBAT_DIVIDER_RATIO;
 }
 
-void publishStatus(bool reedClosed) {
+// Logs 10 consecutive raw reads so the actual settling/drift behavior of
+// VBAT_MEAS is visible, instead of guessing at it.
+void logTenBatteryReads() {
+  const int NUM_READS = 10;
+  int rawReadings[NUM_READS];
+
+  for (int i = 0; i < NUM_READS; i++) {
+    rawReadings[i] = analogRead(VBAT_MEAS_PIN);
+  }
+
+  for (int i = 0; i < NUM_READS; i++) {
+    float vbat = (rawReadings[i] / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE * VBAT_DIVIDER_RATIO;
+    Log.info("vbat read %d: raw=%d vbat=%.3f", i, rawReadings[i], vbat);
+  }
+}
+
+// Prints raw AT command responses as they arrive
+int atCallback(int type, const char* buf, int len, void* data) {
+  if (buf) {
+    Log.info("%.*s", len, buf);
+  }
+  return WAIT;
+}
+
+// Full airtime scan: lists every operator the modem can see and whether
+// this SIM is allowed on it. Empirically this is what got the modem to
+// actually register after it sat at Cellular.ready=0 for a long time.
+void scanNetworks() {
+  Cellular.on();
+  Log.info("Scanning for available networks, this takes 1-3 minutes...");
+  Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=?\r\n");
+}
+
+void publishStatus(bool reedClosed, float vbat) {
   CellularSignal sig = Cellular.RSSI();
   String payload = String::format(
-    "{\"reed\":%d,\"cellular_ready\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f}",
-    reedClosed, Cellular.ready(), sig.getStrengthValue(), sig.getQualityValue());
+    "{\"reed\":%d,\"cellular_ready\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.2f}",
+    reedClosed, Cellular.ready(), sig.getStrengthValue(), sig.getQualityValue(), vbat);
   Particle.publish("reed_status", payload, PRIVATE);
   Log.info("Published: %s", payload.c_str());
 }
@@ -57,16 +84,21 @@ void setup() {
 
 // loop() runs over and over again, as quickly as it can execute.
 void loop() {
-  static bool lastReedState = readReedDebounced();
-  static unsigned long lastPublish = 0;
+  // Starts already "due" ~10s after boot, then every SCAN_RETRY_INTERVAL_MS after that.
+  static unsigned long lastScanAttempt = millis() - SCAN_RETRY_INTERVAL_MS + 10000;
+  static unsigned long lastHeartbeat = 0;
 
-  bool reedState = readReedDebounced();
-  bool changed = (reedState != lastReedState);
-  bool dueForHeartbeat = (millis() - lastPublish >= HEARTBEAT_INTERVAL_MS);
+  if (!Cellular.ready() && (millis() - lastScanAttempt >= SCAN_RETRY_INTERVAL_MS)) {
+    lastScanAttempt = millis();
+    scanNetworks();
+  }
 
-  if ((changed || dueForHeartbeat) && Particle.connected()) {
-    publishStatus(reedState);
-    lastReedState = reedState;
-    lastPublish = millis();
+  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeat = millis();
+    bool reedState = digitalRead(REED_PIN);
+    Log.info("Cellular.ready=%d Particle.connected=%d", Cellular.ready(), Particle.connected());
+    if (Particle.connected()) {
+      publishStatus(reedState, readBatteryVoltage());
+    }
   }
 }
