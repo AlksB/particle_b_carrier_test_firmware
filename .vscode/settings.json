@@ -5,5 +5,5 @@
         "*.ino": "cpp"
     },
     "particle.targetPlatform": "msom",
-    "particle.firmwareVersion": "6.2.1"
+    "particle.firmwareVersion": "6.4.1"
 }

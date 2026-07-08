@@ -53,3 +53,6 @@ Thumbs.db
 *.su
 *.idb
 *.pdb
+
+# clangd compile database (machine-specific, regenerate with gen-compile-commands.sh)
+compile_commands.json
