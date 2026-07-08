@@ -5,3 +5,15 @@ CompileFlags:
     # clangd's query-driver picks up include paths but not this implicit
     # default, so wlan_hal.h's static_assert on enum size fails without it.
     - -fshort-enums
+
+Diagnostics:
+  Suppress:
+    # These only fire under clang's frontend, never under the real
+    # arm-none-eabi-gcc that actually builds the firmware. Root cause is
+    # clang/gcc disagreeing on int32_t's underlying type and access-control
+    # in a template SFINAE trick, inside Device OS headers we don't control.
+    - member_redeclared
+  UnusedIncludes: None
+  # Particle.h is an umbrella header (like Arduino.h): its symbols come
+  # through dozens of nested headers, which include-cleaner can't see
+  # through, so it always flags it as "not used directly".
