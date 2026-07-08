@@ -1,0 +1,7 @@
+CompileFlags:
+  Compiler: /home/user/.particle/toolchains/gcc-arm/10.2.1/bin/arm-none-eabi-gcc
+  Add:
+    # arm-none-eabi-gcc defaults to short (2-byte) enums for this target;
+    # clangd's query-driver picks up include paths but not this implicit
+    # default, so wlan_hal.h's static_assert on enum size fails without it.
+    - -fshort-enums
