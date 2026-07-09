@@ -19,8 +19,12 @@ SYSTEM_MODE(AUTOMATIC);
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 const pin_t REED_PIN = D23;
-const unsigned long HEARTBEAT_INTERVAL_MS = 5000;
-const unsigned long SCAN_RETRY_INTERVAL_MS = 10UL * 60 * 1000; // 10 minutes
+// How long to hibernate between wake cycles. The real product only needs to
+// report a few times a day; 5 minutes here is just for testing.
+const unsigned long WAKE_INTERVAL_MS = 5UL * 60 * 1000; // 5 minutes (test value)
+// If we can't get connected within this long on a given wake, give up for
+// this cycle and try again next wake instead of draining the battery.
+const unsigned long MAX_CONNECT_WAIT_MS = 3UL * 60 * 1000; // 3 minutes
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -76,6 +80,17 @@ void publishStatus(bool reedClosed, float vbat) {
   Log.info("Published: %s", payload.c_str());
 }
 
+// Deepest sleep mode this platform supports. Unlike STOP/ULTRA_LOW_POWER,
+// it needs no network wakeup source (which errors out on this platform, see
+// commit history) and fully powers down until the RTC timer fires - device
+// comes back up through a fresh boot (setup() runs again).
+void hibernateUntilNextWake() {
+  SystemSleepConfiguration sleepConfig;
+  sleepConfig.mode(SystemSleepMode::HIBERNATE)
+             .duration(WAKE_INTERVAL_MS);
+  System.sleep(sleepConfig); // Does not return: device resets on wake.
+}
+
 // setup() runs once, when the device is first turned on
 void setup() {
   WiFi.off();
@@ -84,21 +99,24 @@ void setup() {
 
 // loop() runs over and over again, as quickly as it can execute.
 void loop() {
-  // Starts already "due" ~10s after boot, then every SCAN_RETRY_INTERVAL_MS after that.
-  static unsigned long lastScanAttempt = millis() - SCAN_RETRY_INTERVAL_MS + 10000;
-  static unsigned long lastHeartbeat = 0;
+  static bool scanned = false;
+  static unsigned long wakeStart = millis();
 
-  if (!Cellular.ready() && (millis() - lastScanAttempt >= SCAN_RETRY_INTERVAL_MS)) {
-    lastScanAttempt = millis();
+  if (!Cellular.ready() && !scanned && millis() > 10000) {
+    scanned = true;
     scanNetworks();
   }
 
-  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
-    lastHeartbeat = millis();
-    bool reedState = digitalRead(REED_PIN);
-    Log.info("Cellular.ready=%d Particle.connected=%d", Cellular.ready(), Particle.connected());
-    if (Particle.connected()) {
-      publishStatus(reedState, readBatteryVoltage());
-    }
+  Log.info("Cellular.ready=%d Particle.connected=%d", Cellular.ready(), Particle.connected());
+
+  if (Particle.connected()) {
+    publishStatus(digitalRead(REED_PIN), readBatteryVoltage());
+    hibernateUntilNextWake();
+  } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
+    // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
+    Log.info("Giving up on connecting this cycle");
+    hibernateUntilNextWake();
+  } else {
+    delay(1000);
   }
 }
