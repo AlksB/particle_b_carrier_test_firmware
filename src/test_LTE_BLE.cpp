@@ -21,7 +21,7 @@ SerialLogHandler logHandler(LOG_LEVEL_INFO);
 const pin_t REED_PIN = D23;
 // How long to hibernate between wake cycles. The real product only needs to
 // report a few times a day; 5 minutes here is just for testing.
-const unsigned long WAKE_INTERVAL_MS = 5UL * 60 * 1000; // 5 minutes (test value)
+const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 5 minutes (test value)
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 const unsigned long MAX_CONNECT_WAIT_MS = 3UL * 60 * 1000; // 3 minutes
@@ -65,10 +65,85 @@ int atCallback(int type, const char* buf, int len, void* data) {
 // Full airtime scan: lists every operator the modem can see and whether
 // this SIM is allowed on it. Empirically this is what got the modem to
 // actually register after it sat at Cellular.ready=0 for a long time.
+// Expensive (1-3 minutes, lots of current) - only used as a fallback when
+// the known-operator shortcut below doesn't pan out.
 void scanNetworks() {
   Cellular.on();
   Log.info("Scanning for available networks, this takes 1-3 minutes...");
   Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=?\r\n");
+}
+
+// Backup-RAM-backed storage (survives HIBERNATE - Device OS syncs retained
+// variables to flash automatically on hibernate entry) so we can skip
+// straight to the operator that worked last time instead of paying for a
+// full scan. Zero-initialized on first-ever cold boot.
+retained char g_lastOperatorNumeric[8] = {}; // MCC+MNC, e.g. "28201"
+
+void saveOperator(const char* numeric) {
+  strncpy(g_lastOperatorNumeric, numeric, sizeof(g_lastOperatorNumeric) - 1);
+  g_lastOperatorNumeric[sizeof(g_lastOperatorNumeric) - 1] = '\0';
+}
+
+// Returns true and fills outNumeric if retained memory holds a plausible MCC+MNC value.
+bool loadOperator(char* outNumeric, size_t outSize) {
+  size_t len = strnlen(g_lastOperatorNumeric, sizeof(g_lastOperatorNumeric));
+  if (len < 5 || len > 6) {
+    return false;
+  }
+  for (size_t i = 0; i < len; i++) {
+    if (!isdigit((unsigned char)g_lastOperatorNumeric[i])) {
+      return false;
+    }
+  }
+  strncpy(outNumeric, g_lastOperatorNumeric, outSize - 1);
+  outNumeric[outSize - 1] = '\0';
+  return true;
+}
+
+// Skip the full scan: force the modem to register directly on the operator
+// that worked last time. Much faster/cheaper than searching all operators.
+void tryKnownOperator(const char* numeric) {
+  Cellular.on();
+  Log.info("Trying known operator %s...", numeric);
+  Cellular.command(atCallback, (void*)nullptr, 60000, "AT+COPS=1,2,\"%s\"\r\n", numeric);
+}
+
+// Accumulates AT command response text into a buffer for parsing, instead
+// of just logging it.
+char atResponseBuf[256];
+size_t atResponseLen = 0;
+
+int captureCallback(int type, const char* buf, int len, void* data) {
+  if (buf && atResponseLen + len < sizeof(atResponseBuf) - 1) {
+    memcpy(atResponseBuf + atResponseLen, buf, len);
+    atResponseLen += len;
+    atResponseBuf[atResponseLen] = '\0';
+  }
+  return WAIT;
+}
+
+// Parses the numeric MCC+MNC out of "+COPS: 0,2,"28201",7" so it can be saved.
+bool queryCurrentOperator(char* outNumeric, size_t outSize) {
+  atResponseLen = 0;
+  atResponseBuf[0] = '\0';
+  Cellular.command(captureCallback, (void*)nullptr, 10000, "AT+COPS?\r\n");
+
+  const char* start = strchr(atResponseBuf, '"');
+  if (!start) {
+    return false;
+  }
+  start++;
+  const char* end = strchr(start, '"');
+  if (!end) {
+    return false;
+  }
+  size_t len = end - start;
+  if (len == 0 || len >= outSize) {
+    return false;
+  }
+  memcpy(outNumeric, start, len);
+  outNumeric[len] = '\0';
+  return true;
 }
 
 void publishStatus(bool reedClosed, float vbat) {
@@ -95,21 +170,44 @@ void hibernateUntilNextWake() {
 void setup() {
   WiFi.off();
   pinMode(REED_PIN, INPUT_PULLUP);
+
+  // No GPS antenna on this board - make sure the modem's GNSS is off.
+  // No-op if it was never running.
+  Cellular.on();
+  Cellular.command(atCallback, (void*)nullptr, 10000, "AT+QGPSEND\r\n");
 }
 
 // loop() runs over and over again, as quickly as it can execute.
 void loop() {
-  static bool scanned = false;
+  static bool triedKnownOperator = false;
+  static bool triedFullScan = false;
   static unsigned long wakeStart = millis();
 
-  if (!Cellular.ready() && !scanned && millis() > 10000) {
-    scanned = true;
-    scanNetworks();
+  if (!Cellular.ready() && millis() > 5000) {
+    if (!triedKnownOperator) {
+      triedKnownOperator = true;
+      char numeric[8];
+      if (loadOperator(numeric, sizeof(numeric))) {
+        tryKnownOperator(numeric);
+      } else {
+        // Nothing saved yet (first-ever boot) - go straight to a full scan.
+        triedFullScan = true;
+        scanNetworks();
+      }
+    } else if (!triedFullScan && (millis() - wakeStart > MAX_CONNECT_WAIT_MS / 2)) {
+      // Known operator didn't pan out in time - fall back to a full scan.
+      triedFullScan = true;
+      scanNetworks();
+    }
   }
 
   Log.info("Cellular.ready=%d Particle.connected=%d", Cellular.ready(), Particle.connected());
 
   if (Particle.connected()) {
+    char numeric[8];
+    if (queryCurrentOperator(numeric, sizeof(numeric))) {
+      saveOperator(numeric);
+    }
     publishStatus(digitalRead(REED_PIN), readBatteryVoltage());
     hibernateUntilNextWake();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
