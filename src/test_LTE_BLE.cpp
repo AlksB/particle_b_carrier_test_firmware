@@ -24,7 +24,10 @@ const pin_t REED_PIN = D23;
 const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 5 minutes (test value)
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
-const unsigned long MAX_CONNECT_WAIT_MS = 3UL * 60 * 1000; // 3 minutes
+// Must comfortably cover known-operator attempt (up to 60s) + fallback full
+// scan (up to 180s) + cloud handshake, or we cut the connection off right
+// before it succeeds (see commit history).
+const unsigned long MAX_CONNECT_WAIT_MS = 4UL * 60 * 1000; // 4 minutes
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -166,10 +169,17 @@ void hibernateUntilNextWake() {
   System.sleep(sleepConfig); // Does not return: device resets on wake.
 }
 
+// Captured once at wake, before the modem starts drawing current - a
+// reading taken later (e.g. during a TX burst) would sag and not reflect
+// the battery's actual resting voltage.
+float g_vbatAtWake = 0;
+
 // setup() runs once, when the device is first turned on
 void setup() {
   WiFi.off();
   pinMode(REED_PIN, INPUT_PULLUP);
+
+  g_vbatAtWake = readBatteryVoltage();
 
   // No GPS antenna on this board - make sure the modem's GNSS is off.
   // No-op if it was never running.
@@ -208,7 +218,7 @@ void loop() {
     if (queryCurrentOperator(numeric, sizeof(numeric))) {
       saveOperator(numeric);
     }
-    publishStatus(digitalRead(REED_PIN), readBatteryVoltage());
+    publishStatus(digitalRead(REED_PIN), g_vbatAtWake);
     hibernateUntilNextWake();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
     // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
