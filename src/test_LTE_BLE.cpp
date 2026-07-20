@@ -191,12 +191,6 @@ void setup() {
   pinMode(REED_PIN, INPUT_PULLUP);
 
   g_vbatAtWake = readBatteryVoltage();
-
-  // No GPS antenna on this board - make sure the modem's GNSS is off.
-  // GNSS defaults to off on u-blox SARA-R510, so this may return ERROR
-  // ("already off") rather than OK - that's expected, not a fault.
-  Cellular.on();
-  Cellular.command(atCallback, (void*)nullptr, 10000, "AT+UGPS=0\r\n");
 }
 
 // loop() runs over and over again, as quickly as it can execute.
