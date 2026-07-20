@@ -19,6 +19,14 @@ SYSTEM_MODE(AUTOMATIC);
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 const pin_t REED_PIN = D23;
+
+// While testing remotely (flashing over Particle Cloud), full HIBERNATE
+// leaves only a brief window where the device is actually reachable, and an
+// OTA push can miss it or spill across several wake cycles. Keep this true
+// during remote bring-up so the device stays connected and reflashes land
+// instantly; flip to false for the real deployment cadence.
+const bool TESTING_MODE = true;
+
 // How long to hibernate between wake cycles. The real product only needs to
 // report a few times a day; 5 minutes here is just for testing.
 const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 5 minutes (test value)
@@ -173,6 +181,16 @@ void hibernateUntilNextWake() {
   System.sleep(sleepConfig); // Does not return: device resets on wake.
 }
 
+// In TESTING_MODE, stays connected instead of hibernating so a remote
+// `particle flash` lands immediately. Otherwise sleeps for real.
+void sleepOrIdle() {
+  if (TESTING_MODE) {
+    delay(WAKE_INTERVAL_MS);
+  } else {
+    hibernateUntilNextWake();
+  }
+}
+
 // Captured once at wake, before the modem starts drawing current - a
 // reading taken later (e.g. during a TX burst) would sag and not reflect
 // the battery's actual resting voltage.
@@ -223,11 +241,17 @@ void loop() {
       saveOperator(numeric);
     }
     publishStatus(digitalRead(REED_PIN), g_vbatAtWake);
-    hibernateUntilNextWake();
+    sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
     // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
     Log.info("Giving up on connecting this cycle");
-    hibernateUntilNextWake();
+    if (TESTING_MODE) {
+      // No reboot to reset these, so retry the connect sequence ourselves.
+      triedKnownOperator = false;
+      triedFullScan = false;
+      wakeStart = millis();
+    }
+    sleepOrIdle();
   } else {
     delay(1000);
   }
