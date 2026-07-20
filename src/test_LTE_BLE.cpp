@@ -32,10 +32,12 @@ const bool TESTING_MODE = true;
 const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 5 minutes (test value)
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
-// Must comfortably cover known-operator attempt (up to 60s) + fallback full
-// scan (up to 180s) + cloud handshake, or we cut the connection off right
-// before it succeeds (see commit history).
-const unsigned long MAX_CONNECT_WAIT_MS = 4UL * 60 * 1000; // 4 minutes
+// Cellular.command() blocks the whole loop() for its own timeout, so this
+// can only be checked between AT commands, not preempt one in flight - the
+// real worst case is the sum of both attempts' AT command timeouts (up to
+// 180s known-operator + up to 180s fallback scan, per the SARA-R5 AT
+// manual's documented +COPS response time) plus cloud handshake margin.
+const unsigned long MAX_CONNECT_WAIT_MS = 8UL * 60 * 1000; // 8 minutes
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -101,7 +103,10 @@ bool loadOperator(char* outNumeric, size_t outSize) {
 void tryKnownOperator(const char* numeric) {
   Cellular.on();
   Log.info("Trying known operator %s...", numeric);
-  Cellular.command(atCallback, (void*)nullptr, 60000, "AT+COPS=1,2,\"%s\"\r\n", numeric);
+  // Manual AT+COPS registration is documented at up to 3 min worst case
+  // (same as the fallback scan) - a shorter timeout here would let us give
+  // up on this command while the modem might still be mid-registration.
+  Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=1,2,\"%s\"\r\n", numeric);
 }
 
 // Accumulates AT command response text into a buffer for parsing, instead
