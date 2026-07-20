@@ -49,22 +49,6 @@ static float readBatteryVoltage() {
   return adcVoltage * VBAT_DIVIDER_RATIO;
 }
 
-// Logs 10 consecutive raw reads so the actual settling/drift behavior of
-// VBAT_MEAS is visible, instead of guessing at it.
-void logTenBatteryReads() {
-  const int NUM_READS = 10;
-  int rawReadings[NUM_READS];
-
-  for (int i = 0; i < NUM_READS; i++) {
-    rawReadings[i] = analogRead(VBAT_MEAS_PIN);
-  }
-
-  for (int i = 0; i < NUM_READS; i++) {
-    float vbat = (rawReadings[i] / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE * VBAT_DIVIDER_RATIO;
-    Log.info("vbat read %d: raw=%d vbat=%.3f", i, rawReadings[i], vbat);
-  }
-}
-
 // Prints raw AT command responses as they arrive
 int atCallback(int type, const char* buf, int len, void* data) {
   if (buf) {
@@ -74,8 +58,9 @@ int atCallback(int type, const char* buf, int len, void* data) {
 }
 
 // Full airtime scan: lists every operator the modem can see and whether
-// this SIM is allowed on it. Empirically this is what got the modem to
-// actually register after it sat at Cellular.ready=0 for a long time.
+// this SIM is allowed on it. On the msom/EG91 board this was empirically
+// what got the modem to register after it sat at Cellular.ready=0 for a
+// long time; not yet verified whether SARA-R510 needs the same nudge.
 // Expensive (1-3 minutes, lots of current) - only used as a fallback when
 // the known-operator shortcut below doesn't pan out.
 void scanNetworks() {
