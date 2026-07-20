@@ -122,6 +122,11 @@ int captureCallback(int type, const char* buf, int len, void* data) {
 bool queryCurrentOperator(char* outNumeric, size_t outSize) {
   atResponseLen = 0;
   atResponseBuf[0] = '\0';
+  // AT+COPS? reports <oper> in whichever <format> was last active, which
+  // may not be numeric if this connection came from the scanNetworks()
+  // fallback path instead of tryKnownOperator(). Force numeric format
+  // first (mode=3: set only <format>) so the parsing below is reliable.
+  Cellular.command(atCallback, (void*)nullptr, 10000, "AT+COPS=3,2\r\n");
   Cellular.command(captureCallback, (void*)nullptr, 10000, "AT+COPS?\r\n");
 
   const char* start = strchr(atResponseBuf, '"');
