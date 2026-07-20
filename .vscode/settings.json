@@ -4,7 +4,7 @@
     "files.associations": {
         "*.ino": "cpp"
     },
-    "particle.targetPlatform": "msom",
+    "particle.targetPlatform": "b5som",
     "particle.firmwareVersion": "6.4.1",
     "clangd.arguments": [
         "--query-driver=/home/user/.particle/toolchains/gcc-arm/**/bin/*"

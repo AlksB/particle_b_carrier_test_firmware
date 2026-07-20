@@ -158,10 +158,14 @@ void publishStatus(bool reedClosed, float vbat) {
   Log.info("Published: %s", payload.c_str());
 }
 
-// Deepest sleep mode this platform supports. Unlike STOP/ULTRA_LOW_POWER,
-// it needs no network wakeup source (which errors out on this platform, see
-// commit history) and fully powers down until the RTC timer fires - device
-// comes back up through a fresh boot (setup() runs again).
+// Full reset-based sleep: powers down until the RTC timer fires, device
+// comes back up through a fresh boot (setup() runs again). This is the
+// proven-working approach carried over from the msom/EG91 board, where
+// STOP/ULTRA_LOW_POWER + network standby hit a platform bug. On b5som
+// (nRF52840), the sleep HAL does properly handle a network wakeup source,
+// so ULTRA_LOW_POWER + .network(NETWORK_INTERFACE_CELLULAR,
+// SystemSleepNetworkFlag::INACTIVE_STANDBY) may work here without the full
+// reconnect cost every cycle - untested on real hardware, worth trying.
 void hibernateUntilNextWake() {
   SystemSleepConfiguration sleepConfig;
   sleepConfig.mode(SystemSleepMode::HIBERNATE)
@@ -176,15 +180,15 @@ float g_vbatAtWake = 0;
 
 // setup() runs once, when the device is first turned on
 void setup() {
-  WiFi.off();
   pinMode(REED_PIN, INPUT_PULLUP);
 
   g_vbatAtWake = readBatteryVoltage();
 
   // No GPS antenna on this board - make sure the modem's GNSS is off.
-  // No-op if it was never running.
+  // GNSS defaults to off on u-blox SARA-R510, so this may return ERROR
+  // ("already off") rather than OK - that's expected, not a fault.
   Cellular.on();
-  Cellular.command(atCallback, (void*)nullptr, 10000, "AT+QGPSEND\r\n");
+  Cellular.command(atCallback, (void*)nullptr, 10000, "AT+UGPS=0\r\n");
 }
 
 // loop() runs over and over again, as quickly as it can execute.
