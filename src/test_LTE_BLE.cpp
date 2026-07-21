@@ -229,6 +229,12 @@ void loop() {
     if (queryCurrentOperator(numeric, sizeof(numeric))) {
       saveOperator(numeric);
     }
+    if (TESTING_MODE) {
+      // setup() only runs once for the whole run here (no reboot between
+      // cycles), so the wake-time reading would otherwise go stale for
+      // hours - refresh it every cycle instead.
+      g_vbatAtWake = readBatteryVoltage();
+    }
     publishStatus(digitalRead(REED_PIN), g_vbatAtWake);
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
