@@ -21,7 +21,7 @@ SYSTEM_MODE(AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 3;
+const int FIRMWARE_VERSION = 4;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -50,7 +50,7 @@ bool readReed() {
 // OTA push can miss it or spill across several wake cycles. Keep this true
 // during remote bring-up so the device stays connected and reflashes land
 // instantly; flip to false for the real deployment cadence.
-const bool TESTING_MODE = true;
+const bool TESTING_MODE = false;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
