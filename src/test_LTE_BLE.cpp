@@ -83,10 +83,10 @@ void scanNetworks() {
   Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=?\r\n");
 }
 
-// Backup-RAM-backed storage (survives HIBERNATE - Device OS syncs retained
-// variables to flash automatically on hibernate entry) so we can skip
-// straight to the operator that worked last time instead of paying for a
-// full scan. Zero-initialized on first-ever cold boot.
+// ULTRA_LOW_POWER doesn't lose RAM anyway, but `retained` also protects this
+// across an actual reset (manual reset, watchdog, power loss/recovery) so
+// we can skip straight to the operator that worked last time instead of
+// paying for a full scan. Zero-initialized on first-ever cold boot.
 retained char g_lastOperatorNumeric[8] = {}; // MCC+MNC, e.g. "28201"
 
 void saveOperator(const char* numeric) {
@@ -173,28 +173,42 @@ void publishStatus(bool reedClosed, float vbat) {
   Log.info("Published: %s", payload.c_str());
 }
 
-// Full reset-based sleep: powers down until the RTC timer fires, device
-// comes back up through a fresh boot (setup() runs again). This is the
-// proven-working approach carried over from the msom/EG91 board, where
-// STOP/ULTRA_LOW_POWER + network standby hit a platform bug. On b5som
-// (nRF52840), the sleep HAL does properly handle a network wakeup source,
-// so ULTRA_LOW_POWER + .network(NETWORK_INTERFACE_CELLULAR,
-// SystemSleepNetworkFlag::INACTIVE_STANDBY) may work here without the full
-// reconnect cost every cycle - untested on real hardware, worth trying.
-void hibernateUntilNextWake() {
+// HIBERNATE would be the deepest option, but it requires an external RTC
+// chip (AM1815/AM18x5) to generate the wakeup - that's on Particle's own
+// B-Series Eval Board reference design, not confirmed present on this
+// custom carrier board (not visible on the schematic). Without it,
+// HIBERNATE fails at runtime with SYSTEM_ERROR_NOT_SUPPORTED.
+//
+// ULTRA_LOW_POWER's RTC-based wakeup uses the nRF52840's own internal
+// timer instead, no external chip needed - and unlike msom/rtl872x (which
+// doesn't implement a NETWORK wakeup source at all), b5som's sleep HAL does
+// support it, so cellular can stay registered (INACTIVE_STANDBY) through
+// the sleep instead of a full disconnect/reconnect every cycle. RAM and
+// program state are retained; execution resumes right after this call
+// instead of rebooting - no fresh setup() each cycle like HIBERNATE gave us.
+void sleepWithNetworkStandby() {
   SystemSleepConfiguration sleepConfig;
-  sleepConfig.mode(SystemSleepMode::HIBERNATE)
-             .duration(WAKE_INTERVAL_MS);
-  System.sleep(sleepConfig); // Does not return: device resets on wake.
+  sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
+             .duration(WAKE_INTERVAL_MS)
+             .network(NETWORK_INTERFACE_CELLULAR, SystemSleepNetworkFlag::INACTIVE_STANDBY);
+  SystemSleepResult result = System.sleep(sleepConfig);
+  Log.info("Woke from sleep, reason=%d error=%d", (int)result.wakeupReason(), (int)result.error());
+  if (result.error() != SYSTEM_ERROR_NONE) {
+    // Sleep didn't actually happen (e.g. unexpectedly unsupported config) -
+    // fall back to a plain wait instead of spinning the loop with no pacing.
+    delay(WAKE_INTERVAL_MS);
+  }
 }
 
-// In TESTING_MODE, stays connected instead of hibernating so a remote
-// `particle flash` lands immediately. Otherwise sleeps for real.
+// TESTING_MODE skips real sleep entirely (even ULTRA_LOW_POWER can suspend
+// USB, dropping a local serial monitor) so remote development/flashing
+// stays as uninterrupted as possible. Otherwise sleeps for real; either way
+// nothing reboots, so the connect state below persists across cycles.
 void sleepOrIdle() {
   if (TESTING_MODE) {
     delay(WAKE_INTERVAL_MS);
   } else {
-    hibernateUntilNextWake();
+    sleepWithNetworkStandby();
   }
 }
 
@@ -252,23 +266,19 @@ void loop() {
     if (queryCurrentOperator(numeric, sizeof(numeric))) {
       saveOperator(numeric);
     }
-    if (TESTING_MODE) {
-      // setup() only runs once for the whole run here (no reboot between
-      // cycles), so the wake-time reading would otherwise go stale for
-      // hours - refresh it every cycle instead.
-      g_vbatAtWake = readBatteryVoltage();
-    }
+    // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
+    // same as the plain-delay TESTING_MODE path), so setup() never re-runs
+    // to give us a fresh reading - refresh it every cycle instead.
+    g_vbatAtWake = readBatteryVoltage();
     publishStatus(digitalRead(REED_PIN), g_vbatAtWake);
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
     // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
     Log.info("Giving up on connecting this cycle");
-    if (TESTING_MODE) {
-      // No reboot to reset these, so retry the connect sequence ourselves.
-      triedKnownOperator = false;
-      triedFullScan = false;
-      wakeStart = millis();
-    }
+    // No reboot to reset these, so retry the connect sequence ourselves.
+    triedKnownOperator = false;
+    triedFullScan = false;
+    wakeStart = millis();
     sleepOrIdle();
   } else {
     delay(1000);
