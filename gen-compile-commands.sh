@@ -6,6 +6,8 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+./gen-build-info.sh
+
 DEVICE_OS_VERSION=6.4.1
 GCC_ARM_VERSION=10.2.1
 BUILDSCRIPTS_VERSION=1.17.2
