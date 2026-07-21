@@ -21,7 +21,7 @@ SYSTEM_MODE(AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 2;
+const int FIRMWARE_VERSION = 3;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -32,6 +32,19 @@ SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 const pin_t REED_PIN = D23;
 
+// The internal pull-up is ~13k typ on nRF52840, so leaving it enabled all
+// the time would burn ~VDD/13k =~ 250uA continuously whenever the reed
+// switch is closed - far more than anything we saved by sleeping. We only
+// poll once a minute, so enable the pull-up, sample, then disable it again
+// immediately rather than leaving it on between polls.
+bool readReed() {
+  pinMode(REED_PIN, INPUT_PULLUP);
+  delayMicroseconds(1000); // let the line settle before sampling
+  bool state = digitalRead(REED_PIN);
+  pinMode(REED_PIN, INPUT); // no pull - stop burning current until next poll
+  return state;
+}
+
 // While testing remotely (flashing over Particle Cloud), full HIBERNATE
 // leaves only a brief window where the device is actually reachable, and an
 // OTA push can miss it or spill across several wake cycles. Keep this true
@@ -39,9 +52,12 @@ const pin_t REED_PIN = D23;
 // instantly; flip to false for the real deployment cadence.
 const bool TESTING_MODE = true;
 
-// How long to hibernate between wake cycles. The real product only needs to
-// report a few times a day; 5 minutes here is just for testing.
-const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 5 minutes (test value)
+// How long to sleep between wake cycles - every wake, the reed switch gets
+// polled (and reed_changed fires immediately if it flipped since last time).
+const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 1 minute
+// Full telemetry (reed/cellular/battery) is cheaper to send less often than
+// we poll the reed switch - sent once at boot, then on this cadence.
+const unsigned long TELEMETRY_INTERVAL_MS = 5UL * 60 * 1000; // 5 minutes
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -164,12 +180,22 @@ bool queryCurrentOperator(char* outNumeric, size_t outSize) {
   return true;
 }
 
-void publishStatus(bool reedClosed, float vbat) {
+// Same payload as before (just renamed from "reed_status"), sent once at
+// boot and then on TELEMETRY_INTERVAL_MS - not on every reed poll.
+void publishTelemetry(bool reedClosed, float vbat) {
   CellularSignal sig = Cellular.RSSI();
   String payload = String::format(
     "{\"reed\":%d,\"cellular_ready\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.3f}",
     reedClosed, Cellular.ready(), sig.getStrengthValue(), sig.getQualityValue(), vbat);
-  Particle.publish("reed_status", payload, PRIVATE);
+  Particle.publish("telemetry", payload, PRIVATE);
+  Log.info("Published: %s", payload.c_str());
+}
+
+// Fired immediately (independent of the telemetry cadence) whenever the reed
+// switch flips state between wakes.
+void publishReedChanged(bool reedClosed) {
+  String payload = String::format("{\"reed\":%d,\"timestamp\":%ld}", reedClosed, (long)Time.now());
+  Particle.publish("reed_changed", payload, PRIVATE);
   Log.info("Published: %s", payload.c_str());
 }
 
@@ -224,7 +250,8 @@ void setup() {
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
 
-  pinMode(REED_PIN, INPUT_PULLUP);
+  // Resting state: pull-up off between polls (see readReed()).
+  pinMode(REED_PIN, INPUT);
 
   g_vbatAtWake = readBatteryVoltage();
 }
@@ -266,11 +293,27 @@ void loop() {
     if (queryCurrentOperator(numeric, sizeof(numeric))) {
       saveOperator(numeric);
     }
-    // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
-    // same as the plain-delay TESTING_MODE path), so setup() never re-runs
-    // to give us a fresh reading - refresh it every cycle instead.
-    g_vbatAtWake = readBatteryVoltage();
-    publishStatus(digitalRead(REED_PIN), g_vbatAtWake);
+
+    static bool lastReedState = readReed();
+    static bool telemetryPublishedOnce = false;
+    static unsigned long lastTelemetryMillis = 0;
+
+    bool reedState = readReed();
+    if (reedState != lastReedState) {
+      lastReedState = reedState;
+      publishReedChanged(reedState);
+    }
+
+    if (!telemetryPublishedOnce || (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
+      telemetryPublishedOnce = true;
+      lastTelemetryMillis = millis();
+      // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
+      // same as the plain-delay TESTING_MODE path), so setup() never re-runs
+      // to give us a fresh reading - refresh it right before each send.
+      g_vbatAtWake = readBatteryVoltage();
+      publishTelemetry(reedState, g_vbatAtWake);
+    }
+
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
     // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
