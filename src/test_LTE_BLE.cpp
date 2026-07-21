@@ -14,14 +14,18 @@
 // committed (always regenerated), see .gitignore.
 #include "build_info.h"
 
-// Let Device OS manage the connection to the Particle Cloud
-SYSTEM_MODE(AUTOMATIC);
+// We only want Cellular/cloud brought up on wakes where we actually have
+// something to report (reed_changed or telemetry) - AUTOMATIC would instead
+// have Device OS reconnect the cloud session on every wake regardless.
+// SEMI_AUTOMATIC leaves connecting entirely to explicit Particle.connect()
+// calls in loop() below.
+SYSTEM_MODE(SEMI_AUTOMATIC);
 
 // Bump this and git-tag the release commit (e.g. `git tag fw-v2`) each time
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 4;
+const int FIRMWARE_VERSION = 5;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -185,8 +189,8 @@ bool queryCurrentOperator(char* outNumeric, size_t outSize) {
 void publishTelemetry(bool reedClosed, float vbat) {
   CellularSignal sig = Cellular.RSSI();
   String payload = String::format(
-    "{\"reed\":%d,\"cellular_ready\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.3f}",
-    reedClosed, Cellular.ready(), sig.getStrengthValue(), sig.getQualityValue(), vbat);
+    "{\"reed\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.3f}",
+    reedClosed, sig.getStrengthValue(), sig.getQualityValue(), vbat);
   Particle.publish("telemetry", payload, PRIVATE);
   Log.info("Published: %s", payload.c_str());
 }
@@ -262,8 +266,34 @@ void loop() {
   static bool triedFullScan = false;
   static bool firmwareInfoPublished = false;
   static unsigned long wakeStart = millis();
+  static bool lastReedState = readReed();
+  static bool telemetryPublishedOnce = false;
+  static unsigned long lastTelemetryMillis = 0;
+  // Whether this wake has already committed to connecting. Reed polling
+  // itself is just a GPIO read (see readReed()), so most wakes never need
+  // to set this and go straight back to sleep without touching the radio.
+  static bool reporting = false;
 
-  if (!Cellular.ready() && millis() > 5000) {
+  if (!reporting) {
+    bool reedState = readReed();
+    bool reedChanged = (reedState != lastReedState);
+    bool telemetryDue = !telemetryPublishedOnce ||
+                         (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS);
+
+    if (!reedChanged && !telemetryDue) {
+      // Nothing to report this wake - skip Cellular/cloud entirely.
+      sleepOrIdle();
+      return;
+    }
+
+    reporting = true;
+    wakeStart = millis();
+    triedKnownOperator = false;
+    triedFullScan = false;
+    Particle.connect();
+  }
+
+  if (!Cellular.ready() && millis() - wakeStart > 5000) {
     if (!triedKnownOperator) {
       triedKnownOperator = true;
       char numeric[8];
@@ -294,10 +324,6 @@ void loop() {
       saveOperator(numeric);
     }
 
-    static bool lastReedState = readReed();
-    static bool telemetryPublishedOnce = false;
-    static unsigned long lastTelemetryMillis = 0;
-
     bool reedState = readReed();
     if (reedState != lastReedState) {
       lastReedState = reedState;
@@ -314,14 +340,17 @@ void loop() {
       publishTelemetry(reedState, g_vbatAtWake);
     }
 
+    // Done reporting for this wake - drop the cloud session (Cellular stays
+    // attached, sleepOrIdle() below puts it in standby) so idle wakes go
+    // back to being radio-silent instead of SEMI_AUTOMATIC auto-maintaining
+    // the connection we just opened.
+    Particle.disconnect();
+    reporting = false;
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
     // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
     Log.info("Giving up on connecting this cycle");
-    // No reboot to reset these, so retry the connect sequence ourselves.
-    triedKnownOperator = false;
-    triedFullScan = false;
-    wakeStart = millis();
+    reporting = false;
     sleepOrIdle();
   } else {
     delay(1000);
