@@ -193,6 +193,9 @@ float g_vbatAtWake = 0;
 
 // setup() runs once, when the device is first turned on
 void setup() {
+  // No BLE antenna on this board - keep the radio fully off.
+  BLE.off();
+
   pinMode(REED_PIN, INPUT_PULLUP);
 
   g_vbatAtWake = readBatteryVoltage();
