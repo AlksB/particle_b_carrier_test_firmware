@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 6;
+const int FIRMWARE_VERSION = 7;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -203,9 +203,11 @@ void publishTelemetry(bool reedClosed, float vbat) {
 }
 
 // Fired immediately (independent of the telemetry cadence) whenever the reed
-// switch flips state between wakes.
-void publishReedChanged(bool reedClosed) {
-  String payload = String::format("{\"reed\":%d,\"timestamp\":%ld}", reedClosed, (long)Time.now());
+// switch flips state between wakes. `changedAt` is captured at poll time
+// (see loop()), not at publish time, and rendered via Time.timeStr() instead
+// of a raw unix timestamp.
+void publishReedChanged(bool reedClosed, time_t changedAt) {
+  String payload = String::format("{\"reed\":%d,\"timestamp\":\"%s\"}", reedClosed, Time.timeStr(changedAt).c_str());
   Particle.publish("reed_changed", payload, PRIVATE);
   Log.info("Published: %s", payload.c_str());
 }
@@ -315,6 +317,16 @@ void loop() {
   // actually happened, not just whatever the pin reads once we're connected.
   static bool lastReedState = readReed();
   static bool pendingReedState = lastReedState;
+  // Same idea as pendingReedState - the wall-clock moment of the poll, not
+  // whatever Time.now() reads once we're finally connected (which can be
+  // well after the fact - see wakeStart/MAX_CONNECT_WAIT_MS). Left at 0
+  // (sentinel: "not yet known") whenever Time.isValid() is false at poll
+  // time - e.g. before the very first-ever cloud sync, or after a real
+  // power-loss reset - since Time.now() would just be a bogus default
+  // clock value at that point. Filled in later once we're actually
+  // connected and the cloud has synced real time (see Particle.connected()
+  // block below).
+  static time_t pendingReedTime = 0;
   // Force one reed_changed report on first boot, even though the initial
   // reading trivially matches itself (see lastReedState above) - otherwise
   // the very first known reed state would only ever be visible via telemetry.
@@ -333,6 +345,7 @@ void loop() {
     }
 
     pendingReedState = reedState;
+    pendingReedTime = Time.isValid() ? Time.now() : 0;
     reporting = true;
     wakeStart = millis();
     triedKnownOperator = false;
@@ -376,9 +389,16 @@ void loop() {
       }
     }
 
+    if (pendingReedTime == 0 && Time.isValid()) {
+      // Time wasn't synced yet back when we polled the reed switch (see the
+      // sentinel comment above) - now that the cloud connection has synced
+      // it, this is the best timestamp we can give this report.
+      pendingReedTime = Time.now();
+    }
+
     if (firstReedReport || pendingReedState != lastReedState) {
       lastReedState = pendingReedState;
-      publishReedChanged(pendingReedState);
+      publishReedChanged(pendingReedState, pendingReedTime);
       firstReedReport = false;
     }
 
