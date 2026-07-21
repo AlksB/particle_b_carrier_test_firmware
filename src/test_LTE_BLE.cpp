@@ -21,7 +21,7 @@ SYSTEM_MODE(AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 1;
+const int FIRMWARE_VERSION = 2;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
