@@ -155,7 +155,7 @@ bool queryCurrentOperator(char* outNumeric, size_t outSize) {
 void publishStatus(bool reedClosed, float vbat) {
   CellularSignal sig = Cellular.RSSI();
   String payload = String::format(
-    "{\"reed\":%d,\"cellular_ready\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.2f}",
+    "{\"reed\":%d,\"cellular_ready\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.3f}",
     reedClosed, Cellular.ready(), sig.getStrengthValue(), sig.getQualityValue(), vbat);
   Particle.publish("reed_status", payload, PRIVATE);
   Log.info("Published: %s", payload.c_str());
