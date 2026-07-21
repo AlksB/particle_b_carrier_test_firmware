@@ -56,3 +56,6 @@ Thumbs.db
 
 # clangd compile database (machine-specific, regenerate with gen-compile-commands.sh)
 compile_commands.json
+
+# Generated per-build (git SHA), regenerate with gen-build-info.sh
+src/build_info.h
