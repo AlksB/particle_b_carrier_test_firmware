@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 7;
+const int FIRMWARE_VERSION = 8;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -77,6 +77,14 @@ const unsigned long MAX_CONNECT_WAIT_MS = 8UL * 60 * 1000; // 8 minutes
 // somehow never reports complete/failed (e.g. the transfer stalls), we
 // still need to give up eventually instead of never sleeping again.
 const unsigned long MAX_OTA_WAIT_MS = 5UL * 60 * 1000; // 5 minutes
+
+// How long to keep the connection open after we're done publishing before
+// actually disconnecting. The cloud decides whether to push a pending OTA
+// update asynchronously, and firmware_update_begin (see g_otaInProgress)
+// is delivered via the system thread with some latency - disconnecting the
+// instant our own publish call returns risks tearing the connection down
+// right as a push is starting, before the flag has had a chance to flip.
+const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -309,6 +317,10 @@ void loop() {
   // Set the moment we notice an OTA transfer in progress, so we can bound
   // how long we're willing to wait for it (see MAX_OTA_WAIT_MS).
   static unsigned long otaWaitStart = 0;
+  // Set once we've finished publishing for this session, so we can linger
+  // connected for a bit (see POST_REPORT_LINGER_MS) instead of disconnecting
+  // the instant our own publish call returns.
+  static unsigned long reportDoneAt = 0;
   // Latches the reed reading that actually triggered a report. Connecting
   // can take a while (up to MAX_CONNECT_WAIT_MS), and the reed switch may
   // have flipped back by the time we're finally online - re-sampling at
@@ -352,6 +364,7 @@ void loop() {
     triedFullScan = false;
     operatorQueriedThisSession = false;
     otaWaitStart = 0;
+    reportDoneAt = 0;
     Particle.connect();
   }
 
@@ -381,14 +394,6 @@ void loop() {
       Particle.publish("firmware_info", String::format(
         "{\"version\":%d,\"commit\":\"%s\"}", FIRMWARE_VERSION, GIT_COMMIT_SHA), PRIVATE);
     }
-    if (!operatorQueriedThisSession) {
-      operatorQueriedThisSession = true;
-      char numeric[8];
-      if (queryCurrentOperator(numeric, sizeof(numeric))) {
-        saveOperator(numeric);
-      }
-    }
-
     if (pendingReedTime == 0 && Time.isValid()) {
       // Time wasn't synced yet back when we polled the reed switch (see the
       // sentinel comment above) - now that the cloud connection has synced
@@ -423,13 +428,44 @@ void loop() {
         // worst case the push just gets retried on a later connection.
         Log.info("Giving up waiting on OTA transfer after %lu ms", millis() - otaWaitStart);
         g_otaInProgress = false;
-        otaWaitStart = 0;
       } else {
         // A firmware transfer is actively landing - hold the connection open
         // instead of disconnecting/sleeping out from under it.
         delay(1000);
         return;
       }
+    }
+    otaWaitStart = 0; // not (or no longer) in progress - clear for next time
+
+    if (reportDoneAt == 0) {
+      reportDoneAt = millis();
+    }
+    if (millis() - reportDoneAt < POST_REPORT_LINGER_MS) {
+      // Give the cloud a short window to start a pending OTA push - see
+      // POST_REPORT_LINGER_MS - before we tear the connection down.
+      delay(500);
+      return;
+    }
+
+    // Only refresh the cached operator once we're confident no OTA is
+    // landing (past the g_otaInProgress/linger checks above) - this blocks
+    // on two AT commands (up to 20s combined) sent directly to the modem,
+    // which would otherwise contend with it for the airtime/UART access an
+    // in-flight or about-to-start transfer needs.
+    if (!operatorQueriedThisSession) {
+      operatorQueriedThisSession = true;
+      char numeric[8];
+      if (queryCurrentOperator(numeric, sizeof(numeric))) {
+        saveOperator(numeric);
+      }
+    }
+
+    if (g_otaInProgress) {
+      // A transfer started during the AT commands above - let the
+      // g_otaInProgress branch above handle waiting it out on the next pass
+      // instead of disconnecting right on top of it.
+      delay(500);
+      return;
     }
 
     // Done reporting for this wake - drop the cloud session (Cellular stays
