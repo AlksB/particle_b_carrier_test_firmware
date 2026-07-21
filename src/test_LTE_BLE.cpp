@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 5;
+const int FIRMWARE_VERSION = 6;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -58,10 +58,10 @@ const bool TESTING_MODE = false;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
-const unsigned long WAKE_INTERVAL_MS = 1UL * 60 * 1000; // 1 minute
+const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 5UL * 60 * 1000; // 5 minutes
+const unsigned long TELEMETRY_INTERVAL_MS = 3UL * 60 * 1000; // 5 minutes
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -70,6 +70,13 @@ const unsigned long TELEMETRY_INTERVAL_MS = 5UL * 60 * 1000; // 5 minutes
 // 180s known-operator + up to 180s fallback scan, per the SARA-R5 AT
 // manual's documented +COPS response time) plus cloud handshake margin.
 const unsigned long MAX_CONNECT_WAIT_MS = 8UL * 60 * 1000; // 8 minutes
+
+// Safety cap on how long loop() will hold the connection open for an
+// in-flight OTA transfer (see g_otaInProgress below). The binary itself is
+// tiny (well under 30KB), so this is a generous margin - if firmware_update
+// somehow never reports complete/failed (e.g. the transfer stalls), we
+// still need to give up eventually instead of never sleeping again.
+const unsigned long MAX_OTA_WAIT_MS = 5UL * 60 * 1000; // 5 minutes
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -247,9 +254,28 @@ void sleepOrIdle() {
 // the battery's actual resting voltage.
 float g_vbatAtWake = 0;
 
+// We only stay connected for a few seconds per wake (see loop()), which
+// isn't enough time for an OTA firmware transfer to complete if one lands
+// mid-window. This flag lets loop() hold the connection open instead of
+// disconnecting/sleeping while a transfer is actually in flight, so a
+// pending flash gets a real chance to finish instead of being cut off
+// wake after wake.
+volatile bool g_otaInProgress = false;
+
+void firmwareUpdateHandler(system_event_t event, int param) {
+  if (param == firmware_update_begin || param == firmware_update_progress) {
+    g_otaInProgress = true;
+  } else if (param == firmware_update_complete || param == firmware_update_failed) {
+    Log.info("OTA update finished, param=%d", param);
+    g_otaInProgress = false;
+  }
+}
+
 // setup() runs once, when the device is first turned on
 void setup() {
   Log.info("Firmware version=%d commit=%s", FIRMWARE_VERSION, GIT_COMMIT_SHA);
+
+  System.on(firmware_update, firmwareUpdateHandler);
 
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
@@ -266,17 +292,37 @@ void loop() {
   static bool triedFullScan = false;
   static bool firmwareInfoPublished = false;
   static unsigned long wakeStart = millis();
-  static bool lastReedState = readReed();
   static bool telemetryPublishedOnce = false;
   static unsigned long lastTelemetryMillis = 0;
   // Whether this wake has already committed to connecting. Reed polling
   // itself is just a GPIO read (see readReed()), so most wakes never need
   // to set this and go straight back to sleep without touching the radio.
   static bool reporting = false;
+  // Only refresh the cached operator once per connected session, not once
+  // per loop() iteration - queryCurrentOperator() blocks on two AT commands
+  // (up to 20s combined), which would otherwise keep re-running for as long
+  // as we sit here waiting out an in-flight OTA transfer below, competing
+  // with the modem for time it needs to actually receive the update.
+  static bool operatorQueriedThisSession = false;
+  // Set the moment we notice an OTA transfer in progress, so we can bound
+  // how long we're willing to wait for it (see MAX_OTA_WAIT_MS).
+  static unsigned long otaWaitStart = 0;
+  // Latches the reed reading that actually triggered a report. Connecting
+  // can take a while (up to MAX_CONNECT_WAIT_MS), and the reed switch may
+  // have flipped back by the time we're finally online - re-sampling at
+  // publish time would silently miss that transient change. Latching what
+  // we saw at the moment we decided to report means we publish what
+  // actually happened, not just whatever the pin reads once we're connected.
+  static bool lastReedState = readReed();
+  static bool pendingReedState = lastReedState;
+  // Force one reed_changed report on first boot, even though the initial
+  // reading trivially matches itself (see lastReedState above) - otherwise
+  // the very first known reed state would only ever be visible via telemetry.
+  static bool firstReedReport = true;
+  bool reedState = readReed();
 
   if (!reporting) {
-    bool reedState = readReed();
-    bool reedChanged = (reedState != lastReedState);
+    bool reedChanged = firstReedReport || (reedState != lastReedState);
     bool telemetryDue = !telemetryPublishedOnce ||
                          (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS);
 
@@ -286,10 +332,13 @@ void loop() {
       return;
     }
 
+    pendingReedState = reedState;
     reporting = true;
     wakeStart = millis();
     triedKnownOperator = false;
     triedFullScan = false;
+    operatorQueriedThisSession = false;
+    otaWaitStart = 0;
     Particle.connect();
   }
 
@@ -319,15 +368,18 @@ void loop() {
       Particle.publish("firmware_info", String::format(
         "{\"version\":%d,\"commit\":\"%s\"}", FIRMWARE_VERSION, GIT_COMMIT_SHA), PRIVATE);
     }
-    char numeric[8];
-    if (queryCurrentOperator(numeric, sizeof(numeric))) {
-      saveOperator(numeric);
+    if (!operatorQueriedThisSession) {
+      operatorQueriedThisSession = true;
+      char numeric[8];
+      if (queryCurrentOperator(numeric, sizeof(numeric))) {
+        saveOperator(numeric);
+      }
     }
 
-    bool reedState = readReed();
-    if (reedState != lastReedState) {
-      lastReedState = reedState;
-      publishReedChanged(reedState);
+    if (firstReedReport || pendingReedState != lastReedState) {
+      lastReedState = pendingReedState;
+      publishReedChanged(pendingReedState);
+      firstReedReport = false;
     }
 
     if (!telemetryPublishedOnce || (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
@@ -338,6 +390,26 @@ void loop() {
       // to give us a fresh reading - refresh it right before each send.
       g_vbatAtWake = readBatteryVoltage();
       publishTelemetry(reedState, g_vbatAtWake);
+    }
+
+    if (g_otaInProgress) {
+      if (otaWaitStart == 0) {
+        otaWaitStart = millis();
+      }
+      if (millis() - otaWaitStart > MAX_OTA_WAIT_MS) {
+        // Transfer stalled without ever reporting complete/failed - give up
+        // waiting rather than never sleeping again. Device OS discards an
+        // incomplete/unvalidated update on its own, so bailing here is safe;
+        // worst case the push just gets retried on a later connection.
+        Log.info("Giving up waiting on OTA transfer after %lu ms", millis() - otaWaitStart);
+        g_otaInProgress = false;
+        otaWaitStart = 0;
+      } else {
+        // A firmware transfer is actively landing - hold the connection open
+        // instead of disconnecting/sleeping out from under it.
+        delay(1000);
+        return;
+      }
     }
 
     // Done reporting for this wake - drop the cloud session (Cellular stays
