@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 8;
+const int FIRMWARE_VERSION = 9;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -61,7 +61,7 @@ const bool TESTING_MODE = false;
 const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 3UL * 60 * 1000; // 5 minutes
+const unsigned long TELEMETRY_INTERVAL_MS = 2UL * 60 * 1000; // 5 minutes
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -227,17 +227,24 @@ void publishReedChanged(bool reedClosed, time_t changedAt) {
 // HIBERNATE fails at runtime with SYSTEM_ERROR_NOT_SUPPORTED.
 //
 // ULTRA_LOW_POWER's RTC-based wakeup uses the nRF52840's own internal
-// timer instead, no external chip needed - and unlike msom/rtl872x (which
-// doesn't implement a NETWORK wakeup source at all), b5som's sleep HAL does
-// support it, so cellular can stay registered (INACTIVE_STANDBY) through
-// the sleep instead of a full disconnect/reconnect every cycle. RAM and
-// program state are retained; execution resumes right after this call
-// instead of rebooting - no fresh setup() each cycle like HIBERNATE gave us.
-void sleepWithNetworkStandby() {
+// timer instead, no external chip needed. RAM and program state are
+// retained; execution resumes right after this call instead of rebooting -
+// no fresh setup() each cycle like HIBERNATE gave us.
+//
+// INACTIVE_STANDBY (keeping the SARA modem registered through sleep) was
+// tried first, but the modem's own idle current with standby is ~9mA
+// continuous - Device OS deliberately disables the SARA's 3GPP PSM (real
+// deep sleep) in software (it caused reliability problems in the past, see
+// disablePsmEdrx() upstream), so standby never gets below that ~9mA floor.
+// For a report cadence of a few times a day, 9mA continuously between
+// reports costs far more energy than fully powering the modem off and
+// paying for a cold re-attach (already handled by tryKnownOperator() /
+// scanNetworks() below) each time there's actually something to report.
+void sleepWithCellularOff() {
+  Cellular.off();
   SystemSleepConfiguration sleepConfig;
   sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
-             .duration(WAKE_INTERVAL_MS)
-             .network(NETWORK_INTERFACE_CELLULAR, SystemSleepNetworkFlag::INACTIVE_STANDBY);
+             .duration(WAKE_INTERVAL_MS);
   SystemSleepResult result = System.sleep(sleepConfig);
   Log.info("Woke from sleep, reason=%d error=%d", (int)result.wakeupReason(), (int)result.error());
   if (result.error() != SYSTEM_ERROR_NONE) {
@@ -255,7 +262,7 @@ void sleepOrIdle() {
   if (TESTING_MODE) {
     delay(WAKE_INTERVAL_MS);
   } else {
-    sleepWithNetworkStandby();
+    sleepWithCellularOff();
   }
 }
 
@@ -415,6 +422,11 @@ void loop() {
       // to give us a fresh reading - refresh it right before each send.
       g_vbatAtWake = readBatteryVoltage();
       publishTelemetry(reedState, g_vbatAtWake);
+      // Vitals aren't published automatically - Device OS's own periodic
+      // mode relies on a timer that only ticks while connected, which we
+      // aren't for long. Send one immediately each time telemetry goes out
+      // instead of trying to run a background schedule we can't sustain.
+      Particle.publishVitals(particle::NOW);
     }
 
     if (g_otaInProgress) {

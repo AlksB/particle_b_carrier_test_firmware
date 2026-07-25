@@ -15,8 +15,8 @@ BUILDSCRIPTS_VERSION=1.17.2
 export DEVICE_OS_PATH="$HOME/.particle/toolchains/deviceOS/$DEVICE_OS_VERSION"
 export DEVICE_OS_VERSION
 export GCC_ARM_PATH="$HOME/.particle/toolchains/gcc-arm/$GCC_ARM_VERSION/bin/"
-export PLATFORM=b5som
-export PLATFORM_ID=25
+export PLATFORM=bsom
+export PLATFORM_ID=23
 export APPDIR="$(pwd)"
 export PATH="$HOME/.particle/toolchains/gcc-arm/$GCC_ARM_VERSION/bin:$PATH"
 
