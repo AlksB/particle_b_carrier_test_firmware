@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 9;
+const int FIRMWARE_VERSION = 10;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -85,6 +85,13 @@ const unsigned long MAX_OTA_WAIT_MS = 5UL * 60 * 1000; // 5 minutes
 // instant our own publish call returns risks tearing the connection down
 // right as a push is starting, before the flag has had a chance to flip.
 const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
+
+// How often to refresh the cached operator (see queryCurrentOperator()) -
+// it blocks on two AT commands (up to 20s combined) of connected time on
+// every report, but the actual operator essentially never changes between
+// reports, so paying that cost every single cycle burns battery for very
+// little benefit. Once a day is plenty to catch a real operator change.
+const unsigned long OPERATOR_QUERY_INTERVAL_MS = 24UL * 60 * 60 * 1000; // 24 hours
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -242,6 +249,23 @@ void publishReedChanged(bool reedClosed, time_t changedAt) {
 // scanNetworks() below) each time there's actually something to report.
 void sleepWithCellularOff() {
   Cellular.off();
+  // Cellular.off() is asynchronous - it dispatches the actual power-down
+  // (including toggling the modem's UBPWR/UBRST pins) to the system thread
+  // and returns immediately. System.sleep() halts the system thread
+  // entirely for the sleep duration, so without waiting here we could
+  // freeze that power-down sequence mid-way, leaving the modem in an
+  // inconsistent state that breaks the next Cellular.on()/reconnect.
+  // Observed via serial log: the async power-down consistently takes close
+  // to 19s in practice (mux teardown completing ~9s after a 10s wait gave
+  // up, twice in a row) - 25s gives real margin instead of routinely
+  // hitting the fallback below.
+  unsigned long offWaitStart = millis();
+  while (!Cellular.isOff() && millis() - offWaitStart < 25000) {
+    delay(50);
+  }
+  if (!Cellular.isOff()) {
+    Log.info("Cellular didn't confirm off within timeout, sleeping anyway");
+  }
   SystemSleepConfiguration sleepConfig;
   sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
              .duration(WAKE_INTERVAL_MS);
@@ -297,6 +321,13 @@ void setup() {
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
 
+  // We don't use NFC. Left floating, these two pins can settle at different
+  // logic levels from each other, which the nRF52840 datasheet documents as
+  // causing elevated leakage current (INFC_LEAK) between them. Pulling both
+  // down to the same level avoids it.
+  pinMode(NFC_PIN1, INPUT_PULLDOWN);
+  pinMode(NFC_PIN2, INPUT_PULLDOWN);
+
   // Resting state: pull-up off between polls (see readReed()).
   pinMode(REED_PIN, INPUT);
 
@@ -315,12 +346,16 @@ void loop() {
   // itself is just a GPIO read (see readReed()), so most wakes never need
   // to set this and go straight back to sleep without touching the radio.
   static bool reporting = false;
-  // Only refresh the cached operator once per connected session, not once
-  // per loop() iteration - queryCurrentOperator() blocks on two AT commands
-  // (up to 20s combined), which would otherwise keep re-running for as long
-  // as we sit here waiting out an in-flight OTA transfer below, competing
-  // with the modem for time it needs to actually receive the update.
-  static bool operatorQueriedThisSession = false;
+  // Only refresh the cached operator once per loop() iteration within a
+  // session (queryCurrentOperator() blocks on two AT commands, up to 20s
+  // combined, which would otherwise keep re-running for as long as we sit
+  // here waiting out an in-flight OTA transfer below, competing with the
+  // modem for time it needs to actually receive the update) - AND only once
+  // every OPERATOR_QUERY_INTERVAL_MS overall, not on every single report
+  // (see OPERATOR_QUERY_INTERVAL_MS). Deliberately not reset when a new
+  // reporting session begins - this needs to persist across sessions.
+  static bool operatorQueriedOnce = false;
+  static unsigned long lastOperatorQueryMillis = 0;
   // Set the moment we notice an OTA transfer in progress, so we can bound
   // how long we're willing to wait for it (see MAX_OTA_WAIT_MS).
   static unsigned long otaWaitStart = 0;
@@ -369,7 +404,6 @@ void loop() {
     wakeStart = millis();
     triedKnownOperator = false;
     triedFullScan = false;
-    operatorQueriedThisSession = false;
     otaWaitStart = 0;
     reportDoneAt = 0;
     Particle.connect();
@@ -463,9 +497,12 @@ void loop() {
     // landing (past the g_otaInProgress/linger checks above) - this blocks
     // on two AT commands (up to 20s combined) sent directly to the modem,
     // which would otherwise contend with it for the airtime/UART access an
-    // in-flight or about-to-start transfer needs.
-    if (!operatorQueriedThisSession) {
-      operatorQueriedThisSession = true;
+    // in-flight or about-to-start transfer needs. Also gated to once every
+    // OPERATOR_QUERY_INTERVAL_MS overall (see declaration above), not every
+    // single report.
+    if (!operatorQueriedOnce || (millis() - lastOperatorQueryMillis >= OPERATOR_QUERY_INTERVAL_MS)) {
+      operatorQueriedOnce = true;
+      lastOperatorQueryMillis = millis();
       char numeric[8];
       if (queryCurrentOperator(numeric, sizeof(numeric))) {
         saveOperator(numeric);
