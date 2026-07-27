@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 12;
+const int FIRMWARE_VERSION = 13;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -135,6 +135,14 @@ void forceHandshakeCallback(const char* event, const char* data) {
 }
 
 void forceFullHandshake() {
+  // Particle.subscribe() is additive, not a replace - without this, the
+  // previous session's dummy subscription would still be active alongside
+  // the new one, so after the second-ever call both names would be
+  // permanently subscribed and toggling between them would stop changing
+  // anything. Particle.unsubscribe() only supports "remove everything" (no
+  // per-name overload), which is fine here since this is the only
+  // subscription this firmware ever makes.
+  Particle.unsubscribe();
   g_handshakeToggle = !g_handshakeToggle;
   Particle.subscribe(g_handshakeToggle ? "force_handshake_a" : "force_handshake_b",
                       forceHandshakeCallback);
@@ -251,13 +259,12 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
   return false;
 }
 
-// Same payload as before (just renamed from "reed_status"), sent once at
-// boot and then on TELEMETRY_INTERVAL_MS - not on every reed poll.
+// Sent once at boot and then on TELEMETRY_INTERVAL_MS - not on every reed
+// poll. rsrp/rsrq dropped - Particle.publishVitals() (see loop()) already
+// reports signal strength/quality (plus operator, cell ID, RAT), so this
+// was just duplicating data already going up separately.
 void publishTelemetry(bool reedClosed, float vbat) {
-  CellularSignal sig = Cellular.RSSI();
-  String payload = String::format(
-    "{\"reed\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.3f}",
-    reedClosed, sig.getStrengthValue(), sig.getQualityValue(), vbat);
+  String payload = String::format("{\"reed\":%d,\"vbat\":%.3f}", reedClosed, vbat);
   particle::Future<bool> result = Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
 }
