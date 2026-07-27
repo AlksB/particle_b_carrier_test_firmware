@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 10;
+const int FIRMWARE_VERSION = 11;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -206,6 +206,24 @@ bool queryCurrentOperator(char* outNumeric, size_t outSize) {
   return true;
 }
 
+// Particle.publish() returns a Future<bool> - queued/sent is not the same
+// as acknowledged by the cloud. wait(timeout) blocks until the future is
+// done or the timeout elapses; isSucceeded()/isFailed() on their own block
+// indefinitely if called before the future is actually done, so wait()
+// must be called first with an explicit positive timeout.
+bool waitForPublish(particle::Future<bool>& result, const char* eventName, const char* payload) {
+  if (!result.wait(5000)) {
+    Log.warn("Publish %s timed out waiting for ack: %s", eventName, payload);
+    return false;
+  }
+  if (result.isSucceeded()) {
+    Log.info("Published %s: %s", eventName, payload);
+    return true;
+  }
+  Log.warn("Publish %s failed: %s", eventName, payload);
+  return false;
+}
+
 // Same payload as before (just renamed from "reed_status"), sent once at
 // boot and then on TELEMETRY_INTERVAL_MS - not on every reed poll.
 void publishTelemetry(bool reedClosed, float vbat) {
@@ -213,18 +231,78 @@ void publishTelemetry(bool reedClosed, float vbat) {
   String payload = String::format(
     "{\"reed\":%d,\"rsrp\":%.1f,\"rsrq\":%.1f,\"vbat\":%.3f}",
     reedClosed, sig.getStrengthValue(), sig.getQualityValue(), vbat);
-  Particle.publish("telemetry", payload, PRIVATE);
-  Log.info("Published: %s", payload.c_str());
+  particle::Future<bool> result = Particle.publish("telemetry", payload, PRIVATE);
+  waitForPublish(result, "telemetry", payload.c_str());
 }
 
 // Fired immediately (independent of the telemetry cadence) whenever the reed
 // switch flips state between wakes. `changedAt` is captured at poll time
-// (see loop()), not at publish time, and rendered via Time.timeStr() instead
-// of a raw unix timestamp.
-void publishReedChanged(bool reedClosed, time_t changedAt) {
+// (see enqueueReedTransition()), not at publish time, and rendered via
+// Time.timeStr() instead of a raw unix timestamp. Retries a few times in
+// place (while we're still connected anyway) - this event is the one thing
+// in this firmware that genuinely needs to land, unlike telemetry. Returns
+// whether it was actually acknowledged by the cloud, not just attempted.
+bool publishReedChanged(bool reedClosed, time_t changedAt) {
   String payload = String::format("{\"reed\":%d,\"timestamp\":\"%s\"}", reedClosed, Time.timeStr(changedAt).c_str());
-  Particle.publish("reed_changed", payload, PRIVATE);
-  Log.info("Published: %s", payload.c_str());
+  const int MAX_ATTEMPTS = 3;
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    particle::Future<bool> result = Particle.publish("reed_changed", payload, PRIVATE);
+    if (waitForPublish(result, "reed_changed", payload.c_str())) {
+      return true;
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      Log.warn("Retrying reed_changed publish (attempt %d/%d)", attempt + 1, MAX_ATTEMPTS);
+      delay(1000);
+    }
+  }
+  return false;
+}
+
+// Queue of reed transitions not yet acknowledged by the cloud. A single
+// "pending state" variable isn't enough for a real delivery guarantee: if
+// a publish fails and the reed flips back before the next wake, comparing
+// against "current state" alone silently loses the transition that failed.
+// Each transition is recorded independently, in order, and only removed
+// once actually published successfully. retained (not just static) so a
+// real device reset (crash, brownout) doesn't drop anything still queued.
+struct ReedTransition {
+  bool state;
+  time_t timestamp; // 0 if Time wasn't synced yet at poll time - resolved at drain time
+};
+const int REED_QUEUE_CAPACITY = 16;
+retained ReedTransition g_reedQueue[REED_QUEUE_CAPACITY];
+retained uint8_t g_reedQueueHead = 0; // index of the oldest undelivered entry
+retained uint8_t g_reedQueueCount = 0; // number of entries currently queued
+
+void enqueueReedTransition(bool state, time_t timestamp) {
+  if (g_reedQueueCount >= REED_QUEUE_CAPACITY) {
+    // Pathological case (reed toggling faster than we can ever get a
+    // connection window) - drop the oldest to bound memory and keep making
+    // progress, rather than silently refusing all future transitions.
+    Log.error("Reed transition queue full - dropping oldest entry");
+    g_reedQueueHead = (g_reedQueueHead + 1) % REED_QUEUE_CAPACITY;
+    g_reedQueueCount--;
+  }
+  uint8_t tail = (g_reedQueueHead + g_reedQueueCount) % REED_QUEUE_CAPACITY;
+  g_reedQueue[tail].state = state;
+  g_reedQueue[tail].timestamp = timestamp;
+  g_reedQueueCount++;
+}
+
+// Attempts to deliver every queued transition, oldest first, stopping (and
+// preserving order) at the first one that fails so it's retried - in
+// order - on a later wake instead of letting later entries jump ahead.
+void drainReedQueue() {
+  while (g_reedQueueCount > 0) {
+    ReedTransition& t = g_reedQueue[g_reedQueueHead];
+    time_t ts = (t.timestamp != 0) ? t.timestamp : (Time.isValid() ? Time.now() : 0);
+    if (!publishReedChanged(t.state, ts)) {
+      Log.warn("reed_changed queue drain stopped (%d entries left) - will retry next wake", (int)g_reedQueueCount);
+      break;
+    }
+    g_reedQueueHead = (g_reedQueueHead + 1) % REED_QUEUE_CAPACITY;
+    g_reedQueueCount--;
+  }
 }
 
 // HIBERNATE would be the deepest option, but it requires an external RTC
@@ -363,43 +441,39 @@ void loop() {
   // connected for a bit (see POST_REPORT_LINGER_MS) instead of disconnecting
   // the instant our own publish call returns.
   static unsigned long reportDoneAt = 0;
-  // Latches the reed reading that actually triggered a report. Connecting
-  // can take a while (up to MAX_CONNECT_WAIT_MS), and the reed switch may
-  // have flipped back by the time we're finally online - re-sampling at
-  // publish time would silently miss that transient change. Latching what
-  // we saw at the moment we decided to report means we publish what
-  // actually happened, not just whatever the pin reads once we're connected.
+  // lastReedState here only tracks "what we last saw at poll time", for
+  // edge detection - it does NOT track delivery. Delivery is tracked
+  // independently by the ReedTransition queue above, so a transition that
+  // fails to publish and then reverts before the next wake isn't silently
+  // lost (see enqueueReedTransition()/drainReedQueue()).
   static bool lastReedState = readReed();
-  static bool pendingReedState = lastReedState;
-  // Same idea as pendingReedState - the wall-clock moment of the poll, not
-  // whatever Time.now() reads once we're finally connected (which can be
-  // well after the fact - see wakeStart/MAX_CONNECT_WAIT_MS). Left at 0
-  // (sentinel: "not yet known") whenever Time.isValid() is false at poll
-  // time - e.g. before the very first-ever cloud sync, or after a real
-  // power-loss reset - since Time.now() would just be a bogus default
-  // clock value at that point. Filled in later once we're actually
-  // connected and the cloud has synced real time (see Particle.connected()
-  // block below).
-  static time_t pendingReedTime = 0;
   // Force one reed_changed report on first boot, even though the initial
   // reading trivially matches itself (see lastReedState above) - otherwise
-  // the very first known reed state would only ever be visible via telemetry.
-  static bool firstReedReport = true;
+  // the very first known reed state would never get queued.
+  static bool firstPollThisBoot = true;
   bool reedState = readReed();
 
+  // Detect transitions on every wake (not just when we decide to report)
+  // and queue them immediately - this must happen regardless of whether
+  // this wake ends up connecting, so a flip that happens while we're mid-
+  // session (still connecting, or draining the queue) is captured too.
+  if (firstPollThisBoot || reedState != lastReedState) {
+    firstPollThisBoot = false;
+    lastReedState = reedState;
+    enqueueReedTransition(reedState, Time.isValid() ? Time.now() : 0);
+  }
+
   if (!reporting) {
-    bool reedChanged = firstReedReport || (reedState != lastReedState);
+    bool reedPending = g_reedQueueCount > 0;
     bool telemetryDue = !telemetryPublishedOnce ||
                          (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS);
 
-    if (!reedChanged && !telemetryDue) {
+    if (!reedPending && !telemetryDue) {
       // Nothing to report this wake - skip Cellular/cloud entirely.
       sleepOrIdle();
       return;
     }
 
-    pendingReedState = reedState;
-    pendingReedTime = Time.isValid() ? Time.now() : 0;
     reporting = true;
     wakeStart = millis();
     triedKnownOperator = false;
@@ -435,18 +509,9 @@ void loop() {
       Particle.publish("firmware_info", String::format(
         "{\"version\":%d,\"commit\":\"%s\"}", FIRMWARE_VERSION, GIT_COMMIT_SHA), PRIVATE);
     }
-    if (pendingReedTime == 0 && Time.isValid()) {
-      // Time wasn't synced yet back when we polled the reed switch (see the
-      // sentinel comment above) - now that the cloud connection has synced
-      // it, this is the best timestamp we can give this report.
-      pendingReedTime = Time.now();
-    }
-
-    if (firstReedReport || pendingReedState != lastReedState) {
-      lastReedState = pendingReedState;
-      publishReedChanged(pendingReedState, pendingReedTime);
-      firstReedReport = false;
-    }
+    // Deliver every queued reed transition, oldest first - stops (and
+    // preserves order) at the first failure, retried next wake.
+    drainReedQueue();
 
     if (!telemetryPublishedOnce || (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
       telemetryPublishedOnce = true;
