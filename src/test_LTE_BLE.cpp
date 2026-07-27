@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 11;
+const int FIRMWARE_VERSION = 12;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -58,10 +58,10 @@ const bool TESTING_MODE = false;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
-const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 2UL * 60 * 1000; // 5 minutes
+const unsigned long TELEMETRY_INTERVAL_MS = 3UL * 60 * 1000; // 5 minutes
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -111,6 +111,33 @@ int atCallback(int type, const char* buf, int len, void* data) {
     Log.info("%.*s", len, buf);
   }
   return WAIT;
+}
+
+// Device OS skips the full Hello/Describe cloud handshake ("Skipping HELLO
+// message" / "Checksum has not changed; not sending subscriptions" in the
+// serial log) whenever our subscriptions/variables checksum matches the
+// last connection - a bandwidth/power optimization. But the cloud appears
+// to only decide whether to push a pending OTA update during that full
+// handshake, so a skipped one means a queued update just sits there until
+// some later connection happens to trigger a real handshake instead -
+// which is what made OTA delivery feel like it depended on catching the
+// device at the right moment. Subscribing to a name that differs from
+// last time forces the checksum to mismatch, so this always happens.
+// Alternates between two fixed names instead of a new one each time, so
+// the subscription list stays bounded instead of growing forever.
+retained bool g_handshakeToggle = false;
+
+void forceHandshakeCallback(const char* event, const char* data) {
+  // Nobody publishes to these event names - this subscription exists purely
+  // to change the subscriptions checksum each session (see
+  // forceFullHandshake() above). Logged anyway in case it ever does fire.
+  Log.info("forceHandshakeCallback fired unexpectedly: %s = %s", event, data ? data : "(null)");
+}
+
+void forceFullHandshake() {
+  g_handshakeToggle = !g_handshakeToggle;
+  Particle.subscribe(g_handshakeToggle ? "force_handshake_a" : "force_handshake_b",
+                      forceHandshakeCallback);
 }
 
 // Full airtime scan: lists every operator the modem can see and whether
@@ -480,6 +507,7 @@ void loop() {
     triedFullScan = false;
     otaWaitStart = 0;
     reportDoneAt = 0;
+    forceFullHandshake();
     Particle.connect();
   }
 
