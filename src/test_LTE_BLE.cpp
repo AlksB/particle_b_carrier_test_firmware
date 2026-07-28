@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 13;
+const int FIRMWARE_VERSION = 14;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -111,41 +111,6 @@ int atCallback(int type, const char* buf, int len, void* data) {
     Log.info("%.*s", len, buf);
   }
   return WAIT;
-}
-
-// Device OS skips the full Hello/Describe cloud handshake ("Skipping HELLO
-// message" / "Checksum has not changed; not sending subscriptions" in the
-// serial log) whenever our subscriptions/variables checksum matches the
-// last connection - a bandwidth/power optimization. But the cloud appears
-// to only decide whether to push a pending OTA update during that full
-// handshake, so a skipped one means a queued update just sits there until
-// some later connection happens to trigger a real handshake instead -
-// which is what made OTA delivery feel like it depended on catching the
-// device at the right moment. Subscribing to a name that differs from
-// last time forces the checksum to mismatch, so this always happens.
-// Alternates between two fixed names instead of a new one each time, so
-// the subscription list stays bounded instead of growing forever.
-retained bool g_handshakeToggle = false;
-
-void forceHandshakeCallback(const char* event, const char* data) {
-  // Nobody publishes to these event names - this subscription exists purely
-  // to change the subscriptions checksum each session (see
-  // forceFullHandshake() above). Logged anyway in case it ever does fire.
-  Log.info("forceHandshakeCallback fired unexpectedly: %s = %s", event, data ? data : "(null)");
-}
-
-void forceFullHandshake() {
-  // Particle.subscribe() is additive, not a replace - without this, the
-  // previous session's dummy subscription would still be active alongside
-  // the new one, so after the second-ever call both names would be
-  // permanently subscribed and toggling between them would stop changing
-  // anything. Particle.unsubscribe() only supports "remove everything" (no
-  // per-name overload), which is fine here since this is the only
-  // subscription this firmware ever makes.
-  Particle.unsubscribe();
-  g_handshakeToggle = !g_handshakeToggle;
-  Particle.subscribe(g_handshakeToggle ? "force_handshake_a" : "force_handshake_b",
-                      forceHandshakeCallback);
 }
 
 // Full airtime scan: lists every operator the modem can see and whether
@@ -514,7 +479,6 @@ void loop() {
     triedFullScan = false;
     otaWaitStart = 0;
     reportDoneAt = 0;
-    forceFullHandshake();
     Particle.connect();
   }
 
@@ -621,7 +585,18 @@ void loop() {
     // attached, sleepOrIdle() below puts it in standby) so idle wakes go
     // back to being radio-silent instead of SEMI_AUTOMATIC auto-maintaining
     // the connection we just opened.
-    Particle.disconnect();
+    //
+    // clearSession(true): without this, the next connect resumes the DTLS
+    // session and skips the full Hello/Describe handshake whenever nothing
+    // in our own subscriptions/app-describe state has changed - and that
+    // skip is governed by state bits we have no clean way to force from
+    // application code (confirmed by tracing protocol.cpp: subscribing to
+    // a new event name, tried previously, doesn't affect this at all).
+    // Clearing the session on every disconnect instead forces a genuine
+    // full handshake on the very next connect - the same effect a physical
+    // reset gives, without needing one - so the cloud always gets a real
+    // chance to check for and push a pending OTA update.
+    Particle.disconnect(CloudDisconnectOptions().clearSession(true));
     reporting = false;
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
