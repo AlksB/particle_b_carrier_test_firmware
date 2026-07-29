@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 15;
+const int FIRMWARE_VERSION = 16;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -49,6 +49,26 @@ bool readReedIsClosed() {
   return state;
 }
 
+// The RGB LED doubles as a reed-state indicator while awake: green = reed
+// open, red = reed closed. Driven with plain GPIO (not RGB.color()/PWM) -
+// we only ever need full-on colors, and direct pinMode/digitalWrite makes
+// the sleep/wake pin handling deterministic instead of depending on the
+// LED service's PWM re-attach behavior. Requires RGB.control(true) in
+// setup() so Device OS keeps its own hands off these pins (which also
+// means the usual connection status animations no longer show).
+//
+// Explicitly re-configures the pins as OUTPUT every call, because
+// sleepOrIdle() detaches them (hi-Z) for every sleep window. The LED is
+// common-anode (Particle reference wiring): pin LOW = that color lit.
+void showReedOnLed(bool reedClosed) {
+  pinMode(RGBR, OUTPUT);
+  pinMode(RGBG, OUTPUT);
+  pinMode(RGBB, OUTPUT);
+  digitalWrite(RGBR, reedClosed ? LOW : HIGH);
+  digitalWrite(RGBG, reedClosed ? HIGH : LOW);
+  digitalWrite(RGBB, HIGH);
+}
+
 // While testing remotely (flashing over Particle Cloud), full HIBERNATE
 // leaves only a brief window where the device is actually reachable, and an
 // OTA push can miss it or spill across several wake cycles. Keep this true
@@ -58,10 +78,10 @@ const bool TESTING_MODE = false;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
-const unsigned long WAKE_INTERVAL_MS = 30 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 5 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const unsigned long TELEMETRY_INTERVAL_MS =  3 * 60 * 1000; // 3 mins
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -360,6 +380,15 @@ void sleepWithCellularOff() {
 // stays as uninterrupted as possible. Otherwise sleeps for real; either way
 // nothing reboots, so the connect state below persists across cycles.
 void sleepOrIdle() {
+  // LED off while asleep - both to save power and so a lit LED reliably
+  // means "awake". Hi-Z (INPUT) rather than driving the "off" level: with
+  // the pins detached there's no current path through the LED in either
+  // wiring polarity, and nothing is actively driven during the sleep
+  // window. loop()'s showReedOnLed() call puts them back to OUTPUT with
+  // fresh levels first thing on the next wake.
+  pinMode(RGBR, INPUT);
+  pinMode(RGBG, INPUT);
+  pinMode(RGBB, INPUT);
   if (TESTING_MODE) {
     delay(WAKE_INTERVAL_MS);
   } else {
@@ -408,6 +437,15 @@ void setup() {
   // Resting state: pull-up off between polls (see readReedIsClosed()).
   pinMode(REED_PIN, INPUT);
 
+  // Take the RGB LED over from Device OS so it can show reed state (see
+  // showReedOnLed()) instead of cloud connection status. Set the service's
+  // user color to black so it parks the LED off and then has no reason to
+  // ever touch the pins again - from here on they're plain GPIO, driven
+  // only by showReedOnLed()/sleepOrIdle().
+  RGB.control(true);
+  RGB.color(0, 0, 0);
+  showReedOnLed(readReedIsClosed());
+
   g_vbatAtWake = readBatteryVoltage();
 }
 
@@ -451,6 +489,9 @@ void loop() {
   // the very first known reed state would never get queued.
   static bool firstPollThisBoot = true;
   bool reedState = readReedIsClosed();
+  // Relight the LED with the fresh reading every pass - covers both waking
+  // from sleep (sleepOrIdle() turned it off) and a flip mid-session.
+  showReedOnLed(reedState);
 
   // Detect transitions on every wake (not just when we decide to report)
   // and queue them immediately - this must happen regardless of whether
