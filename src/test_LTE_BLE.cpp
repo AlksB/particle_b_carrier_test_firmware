@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 14;
+const int FIRMWARE_VERSION = 15;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -41,10 +41,10 @@ const pin_t REED_PIN = D23;
 // switch is closed - far more than anything we saved by sleeping. We only
 // poll once a minute, so enable the pull-up, sample, then disable it again
 // immediately rather than leaving it on between polls.
-bool readReed() {
+bool readReedIsClosed() {
   pinMode(REED_PIN, INPUT_PULLUP);
   delayMicroseconds(1000); // let the line settle before sampling
-  bool state = digitalRead(REED_PIN);
+  bool state = !digitalRead(REED_PIN);
   pinMode(REED_PIN, INPUT); // no pull - stop burning current until next poll
   return state;
 }
@@ -58,10 +58,10 @@ const bool TESTING_MODE = false;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
-const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 30 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 3UL * 60 * 1000; // 5 minutes
+const unsigned long TELEMETRY_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -91,7 +91,7 @@ const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
 // every report, but the actual operator essentially never changes between
 // reports, so paying that cost every single cycle burns battery for very
 // little benefit. Once a day is plenty to catch a real operator change.
-const unsigned long OPERATOR_QUERY_INTERVAL_MS = 24UL * 60 * 60 * 1000; // 24 hours
+const unsigned long OPERATOR_QUERY_INTERVAL_MS = 48UL * 60 * 60 * 1000; // 48 hours
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
@@ -229,7 +229,7 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
 // reports signal strength/quality (plus operator, cell ID, RAT), so this
 // was just duplicating data already going up separately.
 void publishTelemetry(bool reedClosed, float vbat) {
-  String payload = String::format("{\"reed\":%d,\"vbat\":%.3f}", reedClosed, vbat);
+  String payload = String::format("{\"reed\":%s,\"vbat\":%.3f}", reedClosed?"closed":"open", vbat);
   particle::Future<bool> result = Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
 }
@@ -242,7 +242,7 @@ void publishTelemetry(bool reedClosed, float vbat) {
 // in this firmware that genuinely needs to land, unlike telemetry. Returns
 // whether it was actually acknowledged by the cloud, not just attempted.
 bool publishReedChanged(bool reedClosed, time_t changedAt) {
-  String payload = String::format("{\"reed\":%d,\"timestamp\":\"%s\"}", reedClosed, Time.timeStr(changedAt).c_str());
+  String payload = String::format("{\"reed\":%s,\"timestamp\":\"%s\"}", reedClosed?"closed":"open", Time.timeStr(changedAt).c_str());
   const int MAX_ATTEMPTS = 3;
   for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     particle::Future<bool> result = Particle.publish("reed_changed", payload, PRIVATE);
@@ -405,7 +405,7 @@ void setup() {
   pinMode(NFC_PIN1, INPUT_PULLDOWN);
   pinMode(NFC_PIN2, INPUT_PULLDOWN);
 
-  // Resting state: pull-up off between polls (see readReed()).
+  // Resting state: pull-up off between polls (see readReedIsClosed()).
   pinMode(REED_PIN, INPUT);
 
   g_vbatAtWake = readBatteryVoltage();
@@ -420,7 +420,7 @@ void loop() {
   static bool telemetryPublishedOnce = false;
   static unsigned long lastTelemetryMillis = 0;
   // Whether this wake has already committed to connecting. Reed polling
-  // itself is just a GPIO read (see readReed()), so most wakes never need
+  // itself is just a GPIO read (see readReedIsClosed()), so most wakes never need
   // to set this and go straight back to sleep without touching the radio.
   static bool reporting = false;
   // Only refresh the cached operator once per loop() iteration within a
@@ -445,12 +445,12 @@ void loop() {
   // independently by the ReedTransition queue above, so a transition that
   // fails to publish and then reverts before the next wake isn't silently
   // lost (see enqueueReedTransition()/drainReedQueue()).
-  static bool lastReedState = readReed();
+  static bool lastReedState = readReedIsClosed();
   // Force one reed_changed report on first boot, even though the initial
   // reading trivially matches itself (see lastReedState above) - otherwise
   // the very first known reed state would never get queued.
   static bool firstPollThisBoot = true;
-  bool reedState = readReed();
+  bool reedState = readReedIsClosed();
 
   // Detect transitions on every wake (not just when we decide to report)
   // and queue them immediately - this must happen regardless of whether
