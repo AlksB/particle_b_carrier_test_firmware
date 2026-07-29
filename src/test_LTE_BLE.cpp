@@ -34,7 +34,7 @@ PRODUCT_VERSION(FIRMWARE_VERSION)
 // View logs with CLI using 'particle serial monitor --follow'
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-const pin_t REED_PIN = D23;
+const pin_t REED_PIN = D7;
 
 // The internal pull-up is ~13k typ on nRF52840, so leaving it enabled all
 // the time would burn ~VDD/13k =~ 250uA continuously whenever the reed
