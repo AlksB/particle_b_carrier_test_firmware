@@ -430,9 +430,12 @@ void setup() {
   // We don't use NFC. Left floating, these two pins can settle at different
   // logic levels from each other, which the nRF52840 datasheet documents as
   // causing elevated leakage current (INFC_LEAK) between them. Pulling both
-  // down to the same level avoids it.
+  // down to the same level avoids it. Only SoM platforms expose these pins
+  // (a Boron used as a bench test target doesn't define them).
+#if PLATFORM_ID == PLATFORM_BSOM
   pinMode(NFC_PIN1, INPUT_PULLDOWN);
   pinMode(NFC_PIN2, INPUT_PULLDOWN);
+#endif
 
   // Resting state: pull-up off between polls (see readReedIsClosed()).
   pinMode(REED_PIN, INPUT);
