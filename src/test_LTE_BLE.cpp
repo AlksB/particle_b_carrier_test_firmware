@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 16;
+const int FIRMWARE_VERSION = 17;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -34,7 +34,7 @@ PRODUCT_VERSION(FIRMWARE_VERSION)
 // View logs with CLI using 'particle serial monitor --follow'
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-const pin_t REED_PIN = D7;
+const pin_t REED_PIN = D6;
 
 // The internal pull-up is ~13k typ on nRF52840, so leaving it enabled all
 // the time would burn ~VDD/13k =~ 250uA continuously whenever the reed
