@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 17;
+const int FIRMWARE_VERSION = 18;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -249,7 +249,7 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
 // reports signal strength/quality (plus operator, cell ID, RAT), so this
 // was just duplicating data already going up separately.
 void publishTelemetry(bool reedClosed, float vbat) {
-  String payload = String::format("{\"reed\":%s,\"vbat\":%.3f}", reedClosed?"closed":"open", vbat);
+  String payload = String::format("{\"reedclosed\":%d,\"vbat\":%.3f}", reedClosed?1:0, vbat);
   particle::Future<bool> result = Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
 }
@@ -262,7 +262,7 @@ void publishTelemetry(bool reedClosed, float vbat) {
 // in this firmware that genuinely needs to land, unlike telemetry. Returns
 // whether it was actually acknowledged by the cloud, not just attempted.
 bool publishReedChanged(bool reedClosed, time_t changedAt) {
-  String payload = String::format("{\"reed\":%s,\"timestamp\":\"%s\"}", reedClosed?"closed":"open", Time.timeStr(changedAt).c_str());
+  String payload = String::format("{\"reedclosed\":%d,\"timestamp\":\"%s\"}", reedClosed?1:0, Time.timeStr(changedAt).c_str());
   const int MAX_ATTEMPTS = 3;
   for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     particle::Future<bool> result = Particle.publish("reed_changed", payload, PRIVATE);
