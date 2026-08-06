@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 19;
+const int FIRMWARE_VERSION = 20;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -125,6 +125,65 @@ static float readBatteryVoltage() {
   return adcVoltage * VBAT_DIVIDER_RATIO;
 }
 
+// Estimates remaining charge from battery voltage.
+//
+// CURVE is read off the published CR123A discharge family measured at a
+// constant 0.7A across eight brands. Each brand's own capacity is normalised
+// to its own 100%, because the brands differ by nearly 2x in absolute
+// capacity (~0.68 to ~1.28 Ah) while their voltage-vs-depth shape is close
+// enough to share one table. That normalisation is also why the table can
+// only ever answer "what fraction of this cell is left", never "how many
+// hours" - a cheap cell reading 2.5V has far fewer mAh behind it than a good
+// one at the same voltage.
+//
+// The reference was drained at a steady 0.7A while this device averages far
+// less, so it sagged harder than we do: at the same real state of charge we
+// read higher than the table says, and the result is biased low. That is the
+// safe direction to be wrong in, and it goes away once a discharge logged on
+// this hardware replaces these numbers.
+//
+// Accuracy is capped by the chemistry regardless: Li-MnO2 holds a flat
+// plateau, and the top ~40% of capacity lives between 2.55 and 2.50V - about
+// 40 ADC counts here. Treat this as a coarse health signal, not a fuel gauge.
+int batteryPercentFromVoltage(float vbat) {
+  struct CurvePoint {
+    float volts;
+    uint8_t percent;
+  };
+  static const CurvePoint CURVE[] = {
+    {2.800f, 100}, {2.620f,  98}, {2.580f,  95}, {2.570f,  91},
+    {2.550f,  82}, {2.530f,  73}, {2.500f,  64}, {2.470f,  55},
+    {2.430f,  45}, {2.380f,  36}, {2.310f,  27}, {2.220f,  18},
+    {2.150f,  14}, {2.050f,   9}, {1.900f,   5}, {1.750f,   2},
+    {1.600f,   0},
+  };
+  const size_t COUNT = sizeof(CURVE) / sizeof(CURVE[0]);
+
+  if (vbat >= CURVE[0].volts) {
+    return 100;
+  }
+  if (vbat <= CURVE[COUNT - 1].volts) {
+    return 0;
+  }
+  
+  int ret = 0;
+  for (size_t i = 1; i < COUNT; i++) {
+    if (vbat >= CURVE[i].volts) {
+      // Interpolate within the bracketing pair. The divisor can't be zero:
+      // the table's voltages strictly decrease.
+      float span = CURVE[i - 1].volts - CURVE[i].volts;
+      float frac = (vbat - CURVE[i].volts) / span;
+      float pct = CURVE[i].percent + frac * ((float)CURVE[i - 1].percent - CURVE[i].percent);
+      ret = (int)(pct + 0.5f);
+      break;
+    }
+  }
+
+  if (ret > 100) return 100;
+  if (ret < 0) return 0;
+  return ret;
+}
+
 // Prints raw AT command responses as they arrive
 int atCallback(int type, const char* buf, int len, void* data) {
   if (buf) {
@@ -144,6 +203,9 @@ void scanNetworks() {
   Log.info("Scanning for available networks, this takes 1-3 minutes...");
   Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=?\r\n");
 }
+
+retained uint32_t g_cloudConnectAttemptsCount = 0;
+retained uint32_t g_cloudConnectSuccesses = 0;
 
 // ULTRA_LOW_POWER doesn't lose RAM anyway, but `retained` also protects this
 // across an actual reset (manual reset, watchdog, power loss/recovery) so
@@ -245,11 +307,55 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
 }
 
 // Sent once at boot and then on TELEMETRY_INTERVAL_MS - not on every reed
-// poll. rsrp/rsrq dropped - Particle.publishVitals() (see loop()) already
-// reports signal strength/quality (plus operator, cell ID, RAT), so this
-// was just duplicating data already going up separately.
-void publishTelemetry(bool reedClosed, float vbat) {
-  String payload = String::format("{\"reedclosed\":%d,\"vbat\":%.3f}", reedClosed?1:0, vbat);
+// poll, which is far more frequent and only needs the radio when the state
+// actually changed.
+//
+// Both battery voltages go out because neither alone is enough. vBatIdle is
+// sampled at wake before the modem powers up, so it's close to open-circuit;
+// vBatLoad is sampled while connected, with the modem drawing. Their
+// difference is the drop across the cell's internal resistance, which climbs
+// steadily as a primary lithium cell depletes - and that climb is the only
+// thing that moves for most of a CR123A's life, since its Li-MnO2 plateau
+// keeps the absolute voltage nearly flat (see batteryPercentFromVoltage()).
+// So the pair is a better end-of-life signal than either reading is.
+//
+// `battery` is derived from vBatLoad rather than vBatIdle: the reference
+// curve behind it was logged under load too, so feeding it the loaded
+// reading keeps both sides of the comparison consistent.
+//
+// signalStrength/signalQuality duplicate what Particle.publishVitals() (see
+// loop()) already reports. That duplication is deliberate: vitals arrive as
+// a separate system event that the Ubidots integration can't fold into the
+// same webhook, and one event with everything in it beats two integrations
+// to maintain. Both are percentages, the same numbers the console shows.
+// They come through as -1 when the modem can't report a level - passed on
+// as-is rather than suppressed, so the consumer sees a value it can filter.
+//
+// connectAttempts counts sessions we started, connectSuccesses those that
+// got far enough to publish and disconnect cleanly. The ratio is the useful
+// part: a device that keeps trying and failing burns far more battery than
+// one that connects first time, and that shows up here long before it shows
+// up as a missed report. Both are `retained` so a reset doesn't zero them.
+void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle, float signalStrength, float signalQuality) {
+  int batteryPercentage = batteryPercentFromVoltage(vBatLoad);
+  String payload = String::format("{"
+                                  "\"reedclosed\":%d,"
+                                  "\"battery\":%d,"
+                                  "\"vBatLoad\":%.3f,"
+                                  "\"vBatIdle\":%.3f,"
+                                  "\"signalStrength\":%.0f,"
+                                  "\"signalQuality\":%.0f,"
+                                  "\"connectAttempts\":%u,"
+                                  "\"connectSuccesses\":%u"
+                                  "}", 
+                                  reedClosed?1:0, 
+                                  batteryPercentage, 
+                                  vBatLoad, 
+                                  vBatIdle,
+                                  signalStrength,
+                                  signalQuality,
+                                  g_cloudConnectAttemptsCount,
+                                  g_cloudConnectSuccesses);
   particle::Future<bool> result = Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
 }
@@ -396,11 +502,6 @@ void sleepOrIdle() {
   }
 }
 
-// Captured once at wake, before the modem starts drawing current - a
-// reading taken later (e.g. during a TX burst) would sag and not reflect
-// the battery's actual resting voltage.
-float g_vbatAtWake = 0;
-
 // We only stay connected for a few seconds per wake (see loop()), which
 // isn't enough time for an OTA firmware transfer to complete if one lands
 // mid-window. This flag lets loop() hold the connection open instead of
@@ -448,8 +549,6 @@ void setup() {
   RGB.control(true);
   RGB.color(0, 0, 0);
   showReedOnLed(readReedIsClosed());
-
-  g_vbatAtWake = readBatteryVoltage();
 }
 
 // loop() runs over and over again, as quickly as it can execute.
@@ -491,6 +590,7 @@ void loop() {
   // reading trivially matches itself (see lastReedState above) - otherwise
   // the very first known reed state would never get queued.
   static bool firstPollThisBoot = true;
+  static float vBatIdle =0.;
   bool reedState = readReedIsClosed();
   // Relight the LED with the fresh reading every pass - covers both waking
   // from sleep (sleepOrIdle() turned it off) and a flip mid-session.
@@ -523,6 +623,8 @@ void loop() {
     triedFullScan = false;
     otaWaitStart = 0;
     reportDoneAt = 0;
+    vBatIdle = readBatteryVoltage();
+    g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX ? UINT32_MAX : g_cloudConnectAttemptsCount+1;
     Particle.connect();
   }
 
@@ -562,8 +664,9 @@ void loop() {
       // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
       // same as the plain-delay TESTING_MODE path), so setup() never re-runs
       // to give us a fresh reading - refresh it right before each send.
-      g_vbatAtWake = readBatteryVoltage();
-      publishTelemetry(reedState, g_vbatAtWake);
+      float vBatLoad = readBatteryVoltage();
+      CellularSignal sig = Cellular.RSSI();
+      publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(), sig.getQuality());
       // Vitals aren't published automatically - Device OS's own periodic
       // mode relies on a timer that only ticks while connected, which we
       // aren't for long. Send one immediately each time telemetry goes out
@@ -640,6 +743,7 @@ void loop() {
     // full handshake on the very next connect - the same effect a physical
     // reset gives, without needing one - so the cloud always gets a real
     // chance to check for and push a pending OTA update.
+    g_cloudConnectSuccesses = g_cloudConnectSuccesses >= UINT32_MAX ? UINT32_MAX : g_cloudConnectSuccesses+1;
     Particle.disconnect(CloudDisconnectOptions().clearSession(true));
     reporting = false;
     sleepOrIdle();
