@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.1nce.com)",
+      "WebFetch(domain:www.dvg.coffee)",
+      "WebFetch(domain:docs.sparkfun.com)",
+      "Bash(clangd --check=src/test_LTE_BLE.cpp --query-driver=\"/home/user/.particle/toolchains/gcc-arm/**/bin/*\")",
+      "Bash(particle compile *)",
+      "WebFetch(domain:docs.particle.io)",
+      "Bash(particle help *)",
+      "Bash(find ~/.particle -maxdepth 1 -iname \"*.json\" 2>/dev/null)",
+      "Read(//home/user/.particle/**)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/home/user/.particle/particle.config.json'\\)\\); print\\(list\\(d.keys\\(\\)\\)\\)\")",
+      "WebFetch(domain:www.manualslib.com)",
+      "WebFetch(domain:docs.nordicsemi.com)"
+    ]
+  }
+}

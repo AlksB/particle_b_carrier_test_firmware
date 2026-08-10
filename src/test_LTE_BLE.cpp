@@ -34,7 +34,7 @@ PRODUCT_VERSION(FIRMWARE_VERSION)
 // View logs with CLI using 'particle serial monitor --follow'
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-const pin_t REED_PIN = D23;
+const pin_t REED_PIN = D6;
 
 // The internal pull-up is ~13k typ on nRF52840, so leaving it enabled all
 // the time would burn ~VDD/13k =~ 250uA continuously whenever the reed
@@ -74,14 +74,14 @@ void showReedOnLed(bool reedClosed) {
 // OTA push can miss it or spill across several wake cycles. Keep this true
 // during remote bring-up so the device stays connected and reflashes land
 // instantly; flip to false for the real deployment cadence.
-const bool TESTING_MODE = false;
+const bool TESTING_MODE = true;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
-const unsigned long WAKE_INTERVAL_MS = 30 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const unsigned long TELEMETRY_INTERVAL_MS = 2 * 60 * 1000; // 12 hours
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
