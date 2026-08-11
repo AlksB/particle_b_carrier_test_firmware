@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 20;
+const int FIRMWARE_VERSION = 22;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -49,39 +49,19 @@ bool readReedIsClosed() {
   return state;
 }
 
-// The RGB LED doubles as a reed-state indicator while awake: green = reed
-// open, red = reed closed. Driven with plain GPIO (not RGB.color()/PWM) -
-// we only ever need full-on colors, and direct pinMode/digitalWrite makes
-// the sleep/wake pin handling deterministic instead of depending on the
-// LED service's PWM re-attach behavior. Requires RGB.control(true) in
-// setup() so Device OS keeps its own hands off these pins (which also
-// means the usual connection status animations no longer show).
-//
-// Explicitly re-configures the pins as OUTPUT every call, because
-// sleepOrIdle() detaches them (hi-Z) for every sleep window. The LED is
-// common-anode (Particle reference wiring): pin LOW = that color lit.
-void showReedOnLed(bool reedClosed) {
-  pinMode(RGBR, OUTPUT);
-  pinMode(RGBG, OUTPUT);
-  pinMode(RGBB, OUTPUT);
-  digitalWrite(RGBR, reedClosed ? LOW : HIGH);
-  digitalWrite(RGBG, reedClosed ? HIGH : LOW);
-  digitalWrite(RGBB, HIGH);
-}
-
 // While testing remotely (flashing over Particle Cloud), full HIBERNATE
 // leaves only a brief window where the device is actually reachable, and an
 // OTA push can miss it or spill across several wake cycles. Keep this true
 // during remote bring-up so the device stays connected and reflashes land
 // instantly; flip to false for the real deployment cadence.
-const bool TESTING_MODE = true;
+const bool TESTING_MODE = false;
 
 // How long to sleep between wake cycles - every wake, the reed switch gets
 // polled (and reed_changed fires immediately if it flipped since last time).
-const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 2 * 60 * 1000; // 12 hours
+const unsigned long TELEMETRY_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
 // Cellular.command() blocks the whole loop() for its own timeout, so this
@@ -116,9 +96,7 @@ const unsigned long OPERATOR_QUERY_INTERVAL_MS = 48UL * 60 * 60 * 1000; // 48 ho
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
 const float ADC_MAX_COUNTS = 4095.0f;
-// Divider R7=470k (VBAT to VBAT_MEAS) / R8=1000k (VBAT_MEAS to GND):
-// VBAT_MEAS = VBAT * R8/(R7+R8), so VBAT = VBAT_MEAS * (R7+R8)/R8
-const float VBAT_DIVIDER_RATIO = (470.0f + 1000.0f) / 1000.0f;
+const float VBAT_DIVIDER_RATIO =  (2940.0f + 442.0f + 2940.0f) / (2940.0f);
 
 static float readBatteryVoltage() {
   float adcVoltage = (analogRead(VBAT_MEAS_PIN) / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
@@ -127,35 +105,64 @@ static float readBatteryVoltage() {
 
 // Estimates remaining charge from battery voltage.
 //
-// CURVE is read off the published CR123A discharge family measured at a
-// constant 0.7A across eight brands. Each brand's own capacity is normalised
-// to its own 100%, because the brands differ by nearly 2x in absolute
-// capacity (~0.68 to ~1.28 Ah) while their voltage-vs-depth shape is close
-// enough to share one table. That normalisation is also why the table can
-// only ever answer "what fraction of this cell is left", never "how many
-// hours" - a cheap cell reading 2.5V has far fewer mAh behind it than a good
-// one at the same voltage.
+// CURVE is read off the published Panasonic Lithium Industrial CR123A
+// discharge family (lygte-info.dk), which plots the same cell at 0.1 through
+// 3.0A. Three of those traces are spliced here, because the load this cell
+// sees is not constant: the boost converter holds the output rail steady, so
+// as the cell sags it must draw proportionally more current to deliver the
+// same power. Any single-current curve would be wrong at one end or the other.
 //
-// The reference was drained at a steady 0.7A while this device averages far
-// less, so it sagged harder than we do: at the same real state of charge we
-// read higher than the table says, and the result is biased low. That is the
-// safe direction to be wrong in, and it goes away once a discharge logged on
-// this hardware replaces these numbers.
+//   above 1.75V  - 0.5A trace, draw at a healthy cell voltage
+//   1.00-1.75V   - 1.0A trace, the rising current has caught up
+//   below 1.00V  - 2.0A trace, current has climbed again
 //
-// Accuracy is capped by the chemistry regardless: Li-MnO2 holds a flat
-// plateau, and the top ~40% of capacity lives between 2.55 and 2.50V - about
-// 40 ADC counts here. Treat this as a coarse health signal, not a fuel gauge.
+// Each lower trace is rescaled to start from whatever the one above it says is
+// left at the handover (~11% at 1.75V, ~4% at 1.00V), so the segments meet
+// without a step. The lower two contribute shape, not capacity: how fast the
+// voltage collapses through that last sliver.
+//
+// Note the whole spliced region below ~1.8V is largely theoretical - the boost
+// converter will drop out well before the cell reaches it. It is here so the
+// function degrades sensibly rather than clamping to a cliff.
+//
+// Percentages are the reference cell's own capacity normalised to 100%
+// (~1.6Ah at 0.5A), so this answers "what fraction of this cell is left",
+// never "how many hours" - another brand at the same voltage has a different
+// number of mAh behind it, and the same Panasonic cell yields ~1.65Ah at 0.1A
+// but only ~0.75Ah at 3A.
+//
+// Accuracy is capped by the chemistry, and this trace shows it starkly: the
+// cell sits between 2.60 and 2.50V from full to roughly half discharged.
+// ~100mV covering half the capacity is tens of ADC counts on this divider, so
+// treat the top half of the scale as barely better than "not dead yet". Below
+// 2.4V it finally becomes informative.
 int batteryPercentFromVoltage(float vbat) {
+  // This board runs two cells in series, so the pack sits at twice the
+  // per-cell voltage while its capacity - and therefore the whole shape of
+  // the curve below - is that of a single cell. The table keeps the
+  // datasheet's per-cell figures and doubles them here, so it stays directly
+  // comparable to the published traces and a one-cell build only needs this
+  // constant changed.
+  static const int CELLS_IN_SERIES = 2;
   struct CurvePoint {
     float volts;
     uint8_t percent;
   };
   static const CurvePoint CURVE[] = {
-    {2.800f, 100}, {2.620f,  98}, {2.580f,  95}, {2.570f,  91},
-    {2.550f,  82}, {2.530f,  73}, {2.500f,  64}, {2.470f,  55},
-    {2.430f,  45}, {2.380f,  36}, {2.310f,  27}, {2.220f,  18},
-    {2.150f,  14}, {2.050f,   9}, {1.900f,   5}, {1.750f,   2},
-    {1.600f,   0},
+    // 0.5A trace
+    {2.850f * CELLS_IN_SERIES, 100}, {2.600f * CELLS_IN_SERIES,  97},
+    {2.580f * CELLS_IN_SERIES,  94}, {2.570f * CELLS_IN_SERIES,  84},
+    {2.560f * CELLS_IN_SERIES,  69}, {2.540f * CELLS_IN_SERIES,  53},
+    {2.520f * CELLS_IN_SERIES,  44}, {2.500f * CELLS_IN_SERIES,  38},
+    {2.460f * CELLS_IN_SERIES,  31}, {2.400f * CELLS_IN_SERIES,  25},
+    {2.350f * CELLS_IN_SERIES,  22}, {2.250f * CELLS_IN_SERIES,  19},
+    {2.100f * CELLS_IN_SERIES,  16}, {1.900f * CELLS_IN_SERIES,  13},
+    // 1.0A trace, rescaled to meet the above at 11%
+    {1.750f * CELLS_IN_SERIES,  11}, {1.700f * CELLS_IN_SERIES,  10},
+    {1.500f * CELLS_IN_SERIES,   8}, {1.250f * CELLS_IN_SERIES,   6},
+    // 2.0A trace, rescaled to meet the above at 4%
+    {1.000f * CELLS_IN_SERIES,   4}, {0.850f * CELLS_IN_SERIES,   2},
+    {0.700f * CELLS_IN_SERIES,   0},
   };
   const size_t COUNT = sizeof(CURVE) / sizeof(CURVE[0]);
 
@@ -540,15 +547,6 @@ void setup() {
 
   // Resting state: pull-up off between polls (see readReedIsClosed()).
   pinMode(REED_PIN, INPUT);
-
-  // Take the RGB LED over from Device OS so it can show reed state (see
-  // showReedOnLed()) instead of cloud connection status. Set the service's
-  // user color to black so it parks the LED off and then has no reason to
-  // ever touch the pins again - from here on they're plain GPIO, driven
-  // only by showReedOnLed()/sleepOrIdle().
-  RGB.control(true);
-  RGB.color(0, 0, 0);
-  showReedOnLed(readReedIsClosed());
 }
 
 // loop() runs over and over again, as quickly as it can execute.
@@ -594,7 +592,7 @@ void loop() {
   bool reedState = readReedIsClosed();
   // Relight the LED with the fresh reading every pass - covers both waking
   // from sleep (sleepOrIdle() turned it off) and a flip mid-session.
-  showReedOnLed(reedState);
+  //showReedOnLed(reedState);
 
   // Detect transitions on every wake (not just when we decide to report)
   // and queue them immediately - this must happen regardless of whether
@@ -645,8 +643,6 @@ void loop() {
       scanNetworks();
     }
   }
-
-  Log.info("Cellular.ready=%d Particle.connected=%d", Cellular.ready(), Particle.connected());
 
   if (Particle.connected()) {
     if (!firmwareInfoPublished) {
