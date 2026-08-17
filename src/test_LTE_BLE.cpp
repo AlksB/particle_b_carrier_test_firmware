@@ -25,7 +25,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 22;
+const int FIRMWARE_VERSION = 23;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -105,64 +105,50 @@ static float readBatteryVoltage() {
 
 // Estimates remaining charge from battery voltage.
 //
-// CURVE is read off the published Panasonic Lithium Industrial CR123A
-// discharge family (lygte-info.dk), which plots the same cell at 0.1 through
-// 3.0A. Three of those traces are spliced here, because the load this cell
-// sees is not constant: the boost converter holds the output rail steady, so
-// as the cell sags it must draw proportionally more current to deliver the
-// same power. Any single-current curve would be wrong at one end or the other.
+// CURVE is calibrated from an actual full discharge of this hardware: a fresh
+// pair of CR123A cells run from installation to device death (2026-08-13
+// 19:07 to 2026-08-17 01:39 UTC, 78.5 hours, 857 telemetry reports at the
+// production ~5.5-minute cadence, fw v22 / c71a084). Ground truth per sample
+// is the fraction of total runtime remaining at that moment - the cadence is
+// constant, so elapsed time tracks consumed charge - and the table pairs each
+// voltage with the median truth of all samples seen at that voltage. So the
+// output answers "what fraction of the observed service life is left on this
+// board", with the divider, boost-converter load profile and reporting duty
+// cycle all baked in, rather than quoting a datasheet cell.
 //
-//   above 1.75V  - 0.5A trace, draw at a healthy cell voltage
-//   1.00-1.75V   - 1.0A trace, the rising current has caught up
-//   below 1.00V  - 2.0A trace, current has climbed again
+// Input must be vBatLoad (sampled while the modem is up and drawing): the
+// calibration run logged that reading, and publishTelemetry() feeds it here.
 //
-// Each lower trace is rescaled to start from whatever the one above it says is
-// left at the handover (~11% at 1.75V, ~4% at 1.00V), so the segments meet
-// without a step. The lower two contribute shape, not capacity: how fast the
-// voltage collapses through that last sliver.
+// The chemistry caps accuracy at the top. A fresh pack sags from 6.4V to
+// ~5.72V within the first half hour, then *recovers* to ~5.81V and only
+// passes 5.72V again near 40% - so any reading in the 5.70-5.81V band is
+// ambiguous between ~95% and ~40%, and the table resolves it with the median
+// (most samples at those voltages were mid-life). That ambiguity is why this
+// function is no longer called directly for telemetry:
+// batteryPercentEstimate() below folds in the connect counter, which does
+// distinguish the two ends of the band. Below ~5.6V the curve steepens and
+// voltage alone is within a couple of percent of truth.
 //
-// Note the whole spliced region below ~1.8V is largely theoretical - the boost
-// converter will drop out well before the cell reaches it. It is here so the
-// function degrades sensibly rather than clamping to a cliff.
-//
-// Percentages are the reference cell's own capacity normalised to 100%
-// (~1.6Ah at 0.5A), so this answers "what fraction of this cell is left",
-// never "how many hours" - another brand at the same voltage has a different
-// number of mAh behind it, and the same Panasonic cell yields ~1.65Ah at 0.1A
-// but only ~0.75Ah at 3A.
-//
-// Accuracy is capped by the chemistry, and this trace shows it starkly: the
-// cell sits between 2.60 and 2.50V from full to roughly half discharged.
-// ~100mV covering half the capacity is tens of ADC counts on this divider, so
-// treat the top half of the scale as barely better than "not dead yet". Below
-// 2.4V it finally becomes informative.
+// The pack died within an hour of reporting 2.96V, so the 2.90V floor is the
+// real cliff edge, not a theoretical cell cutoff.
 int batteryPercentFromVoltage(float vbat) {
-  // This board runs two cells in series, so the pack sits at twice the
-  // per-cell voltage while its capacity - and therefore the whole shape of
-  // the curve below - is that of a single cell. The table keeps the
-  // datasheet's per-cell figures and doubles them here, so it stays directly
-  // comparable to the published traces and a one-cell build only needs this
-  // constant changed.
-  static const int CELLS_IN_SERIES = 2;
+  // Pack voltage of 2xCR123A in series, exactly as readBatteryVoltage()
+  // reports it - the calibration was done on the assembled pack, so per-cell
+  // figures never enter into it.
   struct CurvePoint {
     float volts;
     uint8_t percent;
   };
   static const CurvePoint CURVE[] = {
-    // 0.5A trace
-    {2.850f * CELLS_IN_SERIES, 100}, {2.600f * CELLS_IN_SERIES,  97},
-    {2.580f * CELLS_IN_SERIES,  94}, {2.570f * CELLS_IN_SERIES,  84},
-    {2.560f * CELLS_IN_SERIES,  69}, {2.540f * CELLS_IN_SERIES,  53},
-    {2.520f * CELLS_IN_SERIES,  44}, {2.500f * CELLS_IN_SERIES,  38},
-    {2.460f * CELLS_IN_SERIES,  31}, {2.400f * CELLS_IN_SERIES,  25},
-    {2.350f * CELLS_IN_SERIES,  22}, {2.250f * CELLS_IN_SERIES,  19},
-    {2.100f * CELLS_IN_SERIES,  16}, {1.900f * CELLS_IN_SERIES,  13},
-    // 1.0A trace, rescaled to meet the above at 11%
-    {1.750f * CELLS_IN_SERIES,  11}, {1.700f * CELLS_IN_SERIES,  10},
-    {1.500f * CELLS_IN_SERIES,   8}, {1.250f * CELLS_IN_SERIES,   6},
-    // 2.0A trace, rescaled to meet the above at 4%
-    {1.000f * CELLS_IN_SERIES,   4}, {0.850f * CELLS_IN_SERIES,   2},
-    {0.700f * CELLS_IN_SERIES,   0},
+    {6.40f, 100}, {5.90f,  99},
+    // fresh-sag/recovery ambiguity band: median-of-samples mapping
+    {5.80f,  72}, {5.75f,  64}, {5.70f,  41},
+    // steady decline - this is where the estimate is trustworthy
+    {5.65f,  35}, {5.60f,  30}, {5.50f,  25}, {5.40f,  20},
+    {5.30f,  16}, {5.20f,  13}, {5.10f,  11}, {5.00f,  10},
+    {4.90f,   8}, {4.75f,   7}, {4.60f,   6}, {4.45f,   5},
+    {4.30f,   4}, {4.05f,   3}, {3.75f,   2}, {3.30f,   1},
+    {2.90f,   0},
   };
   const size_t COUNT = sizeof(CURVE) / sizeof(CURVE[0]);
 
@@ -189,6 +175,51 @@ int batteryPercentFromVoltage(float vbat) {
   if (ret > 100) return 100;
   if (ret < 0) return 0;
   return ret;
+}
+
+// Battery estimate that resolves the voltage table's blind spot with the
+// connect counter.
+//
+// In the same calibration run behind batteryPercentFromVoltage()'s table,
+// g_cloudConnectAttemptsCount ticked once per reporting cycle - 860 at the
+// last telemetry, ~868 by actual death - so on a fresh pack the counter is
+// a coulomb counter: charge consumed is attempts/PACK_CONNECT_LIFETIME.
+// That is exactly the signal voltage lacks in the 5.68-5.90V band, where a
+// fresh pack (after its initial sag) and a ~40%-discharged one read the
+// same. Inside that band the counter answers; everywhere else voltage wins:
+//   >= 5.90V - only ever seen on a fresh pack, voltage is unambiguous
+//   <  5.68V - the curve is steep and voltage tracks truth within ~1-2%,
+//              and unlike the counter it stays right if the pack's actual
+//              capacity differs from the calibration pack (other brand,
+//              cold weather) or the counter didn't start at zero
+//
+// Replayed over the calibration log this lands within 0.5% of truth on
+// average (worst 2.3%), against 9.7%/52% for the voltage table alone.
+//
+// The counter reads "cycles on this pack" only because a battery swap cuts
+// power, and retained SRAM does not survive power loss on this board - the
+// calibration run itself started from attempts=1 on fresh cells. If a pack
+// is ever swapped without the counters clearing, the in-band estimate reads
+// low (stale counter), but drops out of the picture as soon as the pack
+// leaves the band; the floor below keeps it from ever claiming near-dead.
+int batteryPercentEstimate(float vbat, uint32_t connectAttempts) {
+  // Connect cycles a pack delivers from fresh to death, from the
+  // calibration run. Re-derive if the reporting cadence or the per-cycle
+  // radio cost changes materially - it is "cycles", not hours.
+  static const float PACK_CONNECT_LIFETIME = 868.0f;
+  static const float AMBIGUOUS_BAND_LOW_V = 5.68f;
+  static const float AMBIGUOUS_BAND_HIGH_V = 5.90f;
+
+  int pctV = batteryPercentFromVoltage(vbat);
+  if (vbat < AMBIGUOUS_BAND_LOW_V || vbat >= AMBIGUOUS_BAND_HIGH_V) {
+    return pctV;
+  }
+  float pctA = 100.0f * (1.0f - (float)connectAttempts / PACK_CONNECT_LIFETIME);
+  // Voltage this high was never observed below ~37% - a counter that claims
+  // less is stale or from a longer-lived pack, so the band floor wins.
+  if (pctA < 38.0f) pctA = 38.0f;
+  if (pctA > 100.0f) pctA = 100.0f;
+  return (int)(pctA + 0.5f);
 }
 
 // Prints raw AT command responses as they arrive
@@ -326,9 +357,11 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
 // keeps the absolute voltage nearly flat (see batteryPercentFromVoltage()).
 // So the pair is a better end-of-life signal than either reading is.
 //
-// `battery` is derived from vBatLoad rather than vBatIdle: the reference
+// `battery` is derived from vBatLoad rather than vBatIdle: the calibration
 // curve behind it was logged under load too, so feeding it the loaded
-// reading keeps both sides of the comparison consistent.
+// reading keeps both sides of the comparison consistent. The connect
+// counter goes in as well - see batteryPercentEstimate() for how it breaks
+// the flat top of the discharge curve.
 //
 // signalStrength/signalQuality duplicate what Particle.publishVitals() (see
 // loop()) already reports. That duplication is deliberate: vitals arrive as
@@ -344,7 +377,7 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
 // one that connects first time, and that shows up here long before it shows
 // up as a missed report. Both are `retained` so a reset doesn't zero them.
 void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle, float signalStrength, float signalQuality) {
-  int batteryPercentage = batteryPercentFromVoltage(vBatLoad);
+  int batteryPercentage = batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
   String payload = String::format("{"
                                   "\"reedclosed\":%d,"
                                   "\"battery\":%d,"
