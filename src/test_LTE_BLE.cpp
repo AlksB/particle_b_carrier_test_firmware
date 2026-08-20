@@ -91,15 +91,17 @@ const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
 // every report, but the actual operator essentially never changes between
 // reports, so paying that cost every single cycle burns battery for very
 // little benefit. Once a day is plenty to catch a real operator change.
-const unsigned long OPERATOR_QUERY_INTERVAL_MS = 48UL * 60 * 60 * 1000; // 48 hours
+const unsigned long OPERATOR_QUERY_INTERVAL_MS =
+    48UL * 60 * 60 * 1000; // 48 hours
 
 const pin_t VBAT_MEAS_PIN = A0;
 const float ADC_REF_VOLTAGE = 3.3f;
 const float ADC_MAX_COUNTS = 4095.0f;
-const float VBAT_DIVIDER_RATIO =  (2940.0f + 442.0f + 2940.0f) / (2940.0f);
+const float VBAT_DIVIDER_RATIO = (2940.0f + 442.0f + 2940.0f) / (2940.0f);
 
 static float readBatteryVoltage() {
-  float adcVoltage = (analogRead(VBAT_MEAS_PIN) / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
+  float adcVoltage =
+      (analogRead(VBAT_MEAS_PIN) / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
   return adcVoltage * VBAT_DIVIDER_RATIO;
 }
 
@@ -140,15 +142,30 @@ int batteryPercentFromVoltage(float vbat) {
     uint8_t percent;
   };
   static const CurvePoint CURVE[] = {
-    {6.40f, 100}, {5.90f,  99},
-    // fresh-sag/recovery ambiguity band: median-of-samples mapping
-    {5.80f,  72}, {5.75f,  64}, {5.70f,  41},
-    // steady decline - this is where the estimate is trustworthy
-    {5.65f,  35}, {5.60f,  30}, {5.50f,  25}, {5.40f,  20},
-    {5.30f,  16}, {5.20f,  13}, {5.10f,  11}, {5.00f,  10},
-    {4.90f,   8}, {4.75f,   7}, {4.60f,   6}, {4.45f,   5},
-    {4.30f,   4}, {4.05f,   3}, {3.75f,   2}, {3.30f,   1},
-    {2.90f,   0},
+      {6.40f, 100},
+      {5.90f, 99},
+      // fresh-sag/recovery ambiguity band: median-of-samples mapping
+      {5.80f, 72},
+      {5.75f, 64},
+      {5.70f, 41},
+      // steady decline - this is where the estimate is trustworthy
+      {5.65f, 35},
+      {5.60f, 30},
+      {5.50f, 25},
+      {5.40f, 20},
+      {5.30f, 16},
+      {5.20f, 13},
+      {5.10f, 11},
+      {5.00f, 10},
+      {4.90f, 8},
+      {4.75f, 7},
+      {4.60f, 6},
+      {4.45f, 5},
+      {4.30f, 4},
+      {4.05f, 3},
+      {3.75f, 2},
+      {3.30f, 1},
+      {2.90f, 0},
   };
   const size_t COUNT = sizeof(CURVE) / sizeof(CURVE[0]);
 
@@ -158,7 +175,7 @@ int batteryPercentFromVoltage(float vbat) {
   if (vbat <= CURVE[COUNT - 1].volts) {
     return 0;
   }
-  
+
   int ret = 0;
   for (size_t i = 1; i < COUNT; i++) {
     if (vbat >= CURVE[i].volts) {
@@ -166,14 +183,17 @@ int batteryPercentFromVoltage(float vbat) {
       // the table's voltages strictly decrease.
       float span = CURVE[i - 1].volts - CURVE[i].volts;
       float frac = (vbat - CURVE[i].volts) / span;
-      float pct = CURVE[i].percent + frac * ((float)CURVE[i - 1].percent - CURVE[i].percent);
+      float pct = CURVE[i].percent +
+                  frac * ((float)CURVE[i - 1].percent - CURVE[i].percent);
       ret = (int)(pct + 0.5f);
       break;
     }
   }
 
-  if (ret > 100) return 100;
-  if (ret < 0) return 0;
+  if (ret > 100)
+    return 100;
+  if (ret < 0)
+    return 0;
   return ret;
 }
 
@@ -217,13 +237,15 @@ int batteryPercentEstimate(float vbat, uint32_t connectAttempts) {
   float pctA = 100.0f * (1.0f - (float)connectAttempts / PACK_CONNECT_LIFETIME);
   // Voltage this high was never observed below ~37% - a counter that claims
   // less is stale or from a longer-lived pack, so the band floor wins.
-  if (pctA < 38.0f) pctA = 38.0f;
-  if (pctA > 100.0f) pctA = 100.0f;
+  if (pctA < 38.0f)
+    pctA = 38.0f;
+  if (pctA > 100.0f)
+    pctA = 100.0f;
   return (int)(pctA + 0.5f);
 }
 
 // Prints raw AT command responses as they arrive
-int atCallback(int type, const char* buf, int len, void* data) {
+int atCallback(int type, const char *buf, int len, void *data) {
   if (buf) {
     Log.info("%.*s", len, buf);
   }
@@ -239,7 +261,7 @@ int atCallback(int type, const char* buf, int len, void* data) {
 void scanNetworks() {
   Cellular.on();
   Log.info("Scanning for available networks, this takes 1-3 minutes...");
-  Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=?\r\n");
+  Cellular.command(atCallback, (void *)nullptr, 180000, "AT+COPS=?\r\n");
 }
 
 retained uint32_t g_cloudConnectAttemptsCount = 0;
@@ -251,13 +273,14 @@ retained uint32_t g_cloudConnectSuccesses = 0;
 // paying for a full scan. Zero-initialized on first-ever cold boot.
 retained char g_lastOperatorNumeric[8] = {}; // MCC+MNC, e.g. "28201"
 
-void saveOperator(const char* numeric) {
+void saveOperator(const char *numeric) {
   strncpy(g_lastOperatorNumeric, numeric, sizeof(g_lastOperatorNumeric) - 1);
   g_lastOperatorNumeric[sizeof(g_lastOperatorNumeric) - 1] = '\0';
 }
 
-// Returns true and fills outNumeric if retained memory holds a plausible MCC+MNC value.
-bool loadOperator(char* outNumeric, size_t outSize) {
+// Returns true and fills outNumeric if retained memory holds a plausible
+// MCC+MNC value.
+bool loadOperator(char *outNumeric, size_t outSize) {
   size_t len = strnlen(g_lastOperatorNumeric, sizeof(g_lastOperatorNumeric));
   if (len < 5 || len > 6) {
     return false;
@@ -274,13 +297,14 @@ bool loadOperator(char* outNumeric, size_t outSize) {
 
 // Skip the full scan: force the modem to register directly on the operator
 // that worked last time. Much faster/cheaper than searching all operators.
-void tryKnownOperator(const char* numeric) {
+void tryKnownOperator(const char *numeric) {
   Cellular.on();
   Log.info("Trying known operator %s...", numeric);
   // Manual AT+COPS registration is documented at up to 3 min worst case
   // (same as the fallback scan) - a shorter timeout here would let us give
   // up on this command while the modem might still be mid-registration.
-  Cellular.command(atCallback, (void*)nullptr, 180000, "AT+COPS=1,2,\"%s\"\r\n", numeric);
+  Cellular.command(atCallback, (void *)nullptr, 180000,
+                   "AT+COPS=1,2,\"%s\"\r\n", numeric);
 }
 
 // Accumulates AT command response text into a buffer for parsing, instead
@@ -288,7 +312,7 @@ void tryKnownOperator(const char* numeric) {
 char atResponseBuf[256];
 size_t atResponseLen = 0;
 
-int captureCallback(int type, const char* buf, int len, void* data) {
+int captureCallback(int type, const char *buf, int len, void *data) {
   if (buf && atResponseLen + len < sizeof(atResponseBuf) - 1) {
     memcpy(atResponseBuf + atResponseLen, buf, len);
     atResponseLen += len;
@@ -298,22 +322,22 @@ int captureCallback(int type, const char* buf, int len, void* data) {
 }
 
 // Parses the numeric MCC+MNC out of "+COPS: 0,2,"28201",7" so it can be saved.
-bool queryCurrentOperator(char* outNumeric, size_t outSize) {
+bool queryCurrentOperator(char *outNumeric, size_t outSize) {
   atResponseLen = 0;
   atResponseBuf[0] = '\0';
   // AT+COPS? reports <oper> in whichever <format> was last active, which
   // may not be numeric if this connection came from the scanNetworks()
   // fallback path instead of tryKnownOperator(). Force numeric format
   // first (mode=3: set only <format>) so the parsing below is reliable.
-  Cellular.command(atCallback, (void*)nullptr, 10000, "AT+COPS=3,2\r\n");
-  Cellular.command(captureCallback, (void*)nullptr, 10000, "AT+COPS?\r\n");
+  Cellular.command(atCallback, (void *)nullptr, 10000, "AT+COPS=3,2\r\n");
+  Cellular.command(captureCallback, (void *)nullptr, 10000, "AT+COPS?\r\n");
 
-  const char* start = strchr(atResponseBuf, '"');
+  const char *start = strchr(atResponseBuf, '"');
   if (!start) {
     return false;
   }
   start++;
-  const char* end = strchr(start, '"');
+  const char *end = strchr(start, '"');
   if (!end) {
     return false;
   }
@@ -331,7 +355,8 @@ bool queryCurrentOperator(char* outNumeric, size_t outSize) {
 // done or the timeout elapses; isSucceeded()/isFailed() on their own block
 // indefinitely if called before the future is actually done, so wait()
 // must be called first with an explicit positive timeout.
-bool waitForPublish(particle::Future<bool>& result, const char* eventName, const char* payload) {
+bool waitForPublish(particle::Future<bool> &result, const char *eventName,
+                    const char *payload) {
   if (!result.wait(5000)) {
     Log.warn("Publish %s timed out waiting for ack: %s", eventName, payload);
     return false;
@@ -376,27 +401,25 @@ bool waitForPublish(particle::Future<bool>& result, const char* eventName, const
 // part: a device that keeps trying and failing burns far more battery than
 // one that connects first time, and that shows up here long before it shows
 // up as a missed report. Both are `retained` so a reset doesn't zero them.
-void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle, float signalStrength, float signalQuality) {
-  int batteryPercentage = batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
-  String payload = String::format("{"
-                                  "\"reedclosed\":%d,"
-                                  "\"battery\":%d,"
-                                  "\"vBatLoad\":%.3f,"
-                                  "\"vBatIdle\":%.3f,"
-                                  "\"signalStrength\":%.0f,"
-                                  "\"signalQuality\":%.0f,"
-                                  "\"connectAttempts\":%u,"
-                                  "\"connectSuccesses\":%u"
-                                  "}", 
-                                  reedClosed?1:0, 
-                                  batteryPercentage, 
-                                  vBatLoad, 
-                                  vBatIdle,
-                                  signalStrength,
-                                  signalQuality,
-                                  g_cloudConnectAttemptsCount,
-                                  g_cloudConnectSuccesses);
-  particle::Future<bool> result = Particle.publish("telemetry", payload, PRIVATE);
+void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
+                      float signalStrength, float signalQuality) {
+  int batteryPercentage =
+      batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
+  String payload = String::format(
+      "{"
+      "\"reedclosed\":%d,"
+      "\"battery\":%d,"
+      "\"vBatLoad\":%.3f,"
+      "\"vBatIdle\":%.3f,"
+      "\"signalStrength\":%.0f,"
+      "\"signalQuality\":%.0f,"
+      "\"connectAttempts\":%u,"
+      "\"connectSuccesses\":%u"
+      "}",
+      reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle, signalStrength,
+      signalQuality, g_cloudConnectAttemptsCount, g_cloudConnectSuccesses);
+  particle::Future<bool> result =
+      Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
 }
 
@@ -408,15 +431,19 @@ void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle, float sig
 // in this firmware that genuinely needs to land, unlike telemetry. Returns
 // whether it was actually acknowledged by the cloud, not just attempted.
 bool publishReedChanged(bool reedClosed, time_t changedAt) {
-  String payload = String::format("{\"reedclosed\":%d,\"timestamp\":\"%s\"}", reedClosed?1:0, Time.timeStr(changedAt).c_str());
+  String payload =
+      String::format("{\"reedclosed\":%d,\"timestamp\":\"%s\"}",
+                     reedClosed ? 1 : 0, Time.timeStr(changedAt).c_str());
   const int MAX_ATTEMPTS = 3;
   for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    particle::Future<bool> result = Particle.publish("reed_changed", payload, PRIVATE);
+    particle::Future<bool> result =
+        Particle.publish("reed_changed", payload, PRIVATE);
     if (waitForPublish(result, "reed_changed", payload.c_str())) {
       return true;
     }
     if (attempt < MAX_ATTEMPTS) {
-      Log.warn("Retrying reed_changed publish (attempt %d/%d)", attempt + 1, MAX_ATTEMPTS);
+      Log.warn("Retrying reed_changed publish (attempt %d/%d)", attempt + 1,
+               MAX_ATTEMPTS);
       delay(1000);
     }
   }
@@ -432,11 +459,12 @@ bool publishReedChanged(bool reedClosed, time_t changedAt) {
 // real device reset (crash, brownout) doesn't drop anything still queued.
 struct ReedTransition {
   bool state;
-  time_t timestamp; // 0 if Time wasn't synced yet at poll time - resolved at drain time
+  time_t timestamp; // 0 if Time wasn't synced yet at poll time - resolved at
+                    // drain time
 };
 const int REED_QUEUE_CAPACITY = 16;
 retained ReedTransition g_reedQueue[REED_QUEUE_CAPACITY];
-retained uint8_t g_reedQueueHead = 0; // index of the oldest undelivered entry
+retained uint8_t g_reedQueueHead = 0;  // index of the oldest undelivered entry
 retained uint8_t g_reedQueueCount = 0; // number of entries currently queued
 
 void enqueueReedTransition(bool state, time_t timestamp) {
@@ -459,10 +487,13 @@ void enqueueReedTransition(bool state, time_t timestamp) {
 // order - on a later wake instead of letting later entries jump ahead.
 void drainReedQueue() {
   while (g_reedQueueCount > 0) {
-    ReedTransition& t = g_reedQueue[g_reedQueueHead];
-    time_t ts = (t.timestamp != 0) ? t.timestamp : (Time.isValid() ? Time.now() : 0);
+    ReedTransition &t = g_reedQueue[g_reedQueueHead];
+    time_t ts =
+        (t.timestamp != 0) ? t.timestamp : (Time.isValid() ? Time.now() : 0);
     if (!publishReedChanged(t.state, ts)) {
-      Log.warn("reed_changed queue drain stopped (%d entries left) - will retry next wake", (int)g_reedQueueCount);
+      Log.warn("reed_changed queue drain stopped (%d entries left) - will "
+               "retry next wake",
+               (int)g_reedQueueCount);
       break;
     }
     g_reedQueueHead = (g_reedQueueHead + 1) % REED_QUEUE_CAPACITY;
@@ -510,10 +541,10 @@ void sleepWithCellularOff() {
     Log.info("Cellular didn't confirm off within timeout, sleeping anyway");
   }
   SystemSleepConfiguration sleepConfig;
-  sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
-             .duration(WAKE_INTERVAL_MS);
+  sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER).duration(WAKE_INTERVAL_MS);
   SystemSleepResult result = System.sleep(sleepConfig);
-  Log.info("Woke from sleep, reason=%d error=%d", (int)result.wakeupReason(), (int)result.error());
+  Log.info("Woke from sleep, reason=%d error=%d", (int)result.wakeupReason(),
+           (int)result.error());
   if (result.error() != SYSTEM_ERROR_NONE) {
     // Sleep didn't actually happen (e.g. unexpectedly unsupported config) -
     // fall back to a plain wait instead of spinning the loop with no pacing.
@@ -553,7 +584,8 @@ volatile bool g_otaInProgress = false;
 void firmwareUpdateHandler(system_event_t event, int param) {
   if (param == firmware_update_begin || param == firmware_update_progress) {
     g_otaInProgress = true;
-  } else if (param == firmware_update_complete || param == firmware_update_failed) {
+  } else if (param == firmware_update_complete ||
+             param == firmware_update_failed) {
     Log.info("OTA update finished, param=%d", param);
     g_otaInProgress = false;
   }
@@ -591,8 +623,8 @@ void loop() {
   static bool telemetryPublishedOnce = false;
   static unsigned long lastTelemetryMillis = 0;
   // Whether this wake has already committed to connecting. Reed polling
-  // itself is just a GPIO read (see readReedIsClosed()), so most wakes never need
-  // to set this and go straight back to sleep without touching the radio.
+  // itself is just a GPIO read (see readReedIsClosed()), so most wakes never
+  // need to set this and go straight back to sleep without touching the radio.
   static bool reporting = false;
   // Only refresh the cached operator once per loop() iteration within a
   // session (queryCurrentOperator() blocks on two AT commands, up to 20s
@@ -621,11 +653,11 @@ void loop() {
   // reading trivially matches itself (see lastReedState above) - otherwise
   // the very first known reed state would never get queued.
   static bool firstPollThisBoot = true;
-  static float vBatIdle =0.;
+  static float vBatIdle = 0.;
   bool reedState = readReedIsClosed();
   // Relight the LED with the fresh reading every pass - covers both waking
   // from sleep (sleepOrIdle() turned it off) and a flip mid-session.
-  //showReedOnLed(reedState);
+  // showReedOnLed(reedState);
 
   // Detect transitions on every wake (not just when we decide to report)
   // and queue them immediately - this must happen regardless of whether
@@ -639,8 +671,9 @@ void loop() {
 
   if (!reporting) {
     bool reedPending = g_reedQueueCount > 0;
-    bool telemetryDue = !telemetryPublishedOnce ||
-                         (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS);
+    bool telemetryDue =
+        !telemetryPublishedOnce ||
+        (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS);
 
     if (!reedPending && !telemetryDue) {
       // Nothing to report this wake - skip Cellular/cloud entirely.
@@ -655,7 +688,9 @@ void loop() {
     otaWaitStart = 0;
     reportDoneAt = 0;
     vBatIdle = readBatteryVoltage();
-    g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX ? UINT32_MAX : g_cloudConnectAttemptsCount+1;
+    g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX
+                                      ? UINT32_MAX
+                                      : g_cloudConnectAttemptsCount + 1;
     Particle.connect();
   }
 
@@ -670,7 +705,8 @@ void loop() {
         triedFullScan = true;
         scanNetworks();
       }
-    } else if (!triedFullScan && (millis() - wakeStart > MAX_CONNECT_WAIT_MS / 2)) {
+    } else if (!triedFullScan &&
+               (millis() - wakeStart > MAX_CONNECT_WAIT_MS / 2)) {
       // Known operator didn't pan out in time - fall back to a full scan.
       triedFullScan = true;
       scanNetworks();
@@ -680,14 +716,17 @@ void loop() {
   if (Particle.connected()) {
     if (!firmwareInfoPublished) {
       firmwareInfoPublished = true;
-      Particle.publish("firmware_info", String::format(
-        "{\"version\":%d,\"commit\":\"%s\"}", FIRMWARE_VERSION, GIT_COMMIT_SHA), PRIVATE);
+      Particle.publish("firmware_info",
+                       String::format("{\"version\":%d,\"commit\":\"%s\"}",
+                                      FIRMWARE_VERSION, GIT_COMMIT_SHA),
+                       PRIVATE);
     }
     // Deliver every queued reed transition, oldest first - stops (and
     // preserves order) at the first failure, retried next wake.
     drainReedQueue();
 
-    if (!telemetryPublishedOnce || (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
+    if (!telemetryPublishedOnce ||
+        (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
       telemetryPublishedOnce = true;
       lastTelemetryMillis = millis();
       // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
@@ -695,7 +734,8 @@ void loop() {
       // to give us a fresh reading - refresh it right before each send.
       float vBatLoad = readBatteryVoltage();
       CellularSignal sig = Cellular.RSSI();
-      publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(), sig.getQuality());
+      publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(),
+                       sig.getQuality());
       // Vitals aren't published automatically - Device OS's own periodic
       // mode relies on a timer that only ticks while connected, which we
       // aren't for long. Send one immediately each time telemetry goes out
@@ -712,7 +752,8 @@ void loop() {
         // waiting rather than never sleeping again. Device OS discards an
         // incomplete/unvalidated update on its own, so bailing here is safe;
         // worst case the push just gets retried on a later connection.
-        Log.info("Giving up waiting on OTA transfer after %lu ms", millis() - otaWaitStart);
+        Log.info("Giving up waiting on OTA transfer after %lu ms",
+                 millis() - otaWaitStart);
         g_otaInProgress = false;
       } else {
         // A firmware transfer is actively landing - hold the connection open
@@ -740,7 +781,8 @@ void loop() {
     // in-flight or about-to-start transfer needs. Also gated to once every
     // OPERATOR_QUERY_INTERVAL_MS overall (see declaration above), not every
     // single report.
-    if (!operatorQueriedOnce || (millis() - lastOperatorQueryMillis >= OPERATOR_QUERY_INTERVAL_MS)) {
+    if (!operatorQueriedOnce ||
+        (millis() - lastOperatorQueryMillis >= OPERATOR_QUERY_INTERVAL_MS)) {
       operatorQueriedOnce = true;
       lastOperatorQueryMillis = millis();
       char numeric[8];
@@ -772,12 +814,15 @@ void loop() {
     // full handshake on the very next connect - the same effect a physical
     // reset gives, without needing one - so the cloud always gets a real
     // chance to check for and push a pending OTA update.
-    g_cloudConnectSuccesses = g_cloudConnectSuccesses >= UINT32_MAX ? UINT32_MAX : g_cloudConnectSuccesses+1;
+    g_cloudConnectSuccesses = g_cloudConnectSuccesses >= UINT32_MAX
+                                  ? UINT32_MAX
+                                  : g_cloudConnectSuccesses + 1;
     Particle.disconnect(CloudDisconnectOptions().clearSession(true));
     reporting = false;
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
-    // Couldn't connect this cycle - don't drain the battery waiting, try again next wake.
+    // Couldn't connect this cycle - don't drain the battery waiting, try again
+    // next wake.
     Log.info("Giving up on connecting this cycle");
     reporting = false;
     sleepOrIdle();

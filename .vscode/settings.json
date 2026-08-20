@@ -9,5 +9,13 @@
     "clangd.arguments": [
         "--query-driver=/home/user/.particle/toolchains/gcc-arm/**/bin/*"
     ],
-    "particle.targetDevice": "e00fce68314b24d7789aa1b3"
+    "particle.targetDevice": "e00fce68314b24d7789aa1b3",
+    "[cpp]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+        "editor.formatOnSave": true
+    },
+    "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+        "editor.formatOnSave": true
+    }
 }
