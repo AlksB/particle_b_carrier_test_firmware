@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "defaultMode": "default"
+  },
+  "theme": "auto",
+  "model": "opus[1m]"
+}

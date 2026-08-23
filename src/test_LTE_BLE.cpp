@@ -76,12 +76,11 @@ const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
 const unsigned long OPERATOR_QUERY_INTERVAL_MS =
     48UL * 60 * 60 * 1000; // 48 hours
 
-const pin_t VBAT_MEAS_PIN = A0;
-const float ADC_REF_VOLTAGE = 3.3f;
-const float ADC_MAX_COUNTS = 4095.0f;
-const float VBAT_DIVIDER_RATIO = (2940.0f + 442.0f + 2940.0f) / (2940.0f);
-
 static float readBatteryVoltage() {
+  const pin_t VBAT_MEAS_PIN = A0;
+  const float ADC_REF_VOLTAGE = 3.3f;
+  const float ADC_MAX_COUNTS = 4095.0f;
+  const float VBAT_DIVIDER_RATIO = (2940.0f + 442.0f + 2940.0f) / (2940.0f);
   float adcVoltage =
       (analogRead(VBAT_MEAS_PIN) / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
   return adcVoltage * VBAT_DIVIDER_RATIO;
