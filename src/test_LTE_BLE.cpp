@@ -46,11 +46,12 @@ const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
 const unsigned long TELEMETRY_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 // If we can't get connected within this long on a given wake, give up for
 // this cycle and try again next wake instead of draining the battery.
-// Cellular.command() blocks the whole loop() for its own timeout, so this
-// can only be checked between AT commands, not preempt one in flight - the
-// real worst case is the sum of both attempts' AT command timeouts (up to
-// 180s known-operator + up to 180s fallback scan, per the SARA-R5 AT
-// manual's documented +COPS response time) plus cloud handshake margin.
+// Nothing in the connect path blocks for long any more - the only AT
+// command we send ourselves is a fast +COPS read - so this budget is
+// honoured as written, unlike when a 180s scan could overrun it. Note that
+// Device OS gives up at its own REGISTRATION_TIMEOUT of 10 minutes, where
+// it resets the modem as a last resort: anything shorter here means we
+// never let it get that far.
 const unsigned long MAX_CONNECT_WAIT_MS = 8UL * 60 * 1000; // 8 minutes
 
 // Safety cap on how long loop() will hold the connection open for an
@@ -67,14 +68,6 @@ const unsigned long MAX_OTA_WAIT_MS = 5UL * 60 * 1000; // 5 minutes
 // instant our own publish call returns risks tearing the connection down
 // right as a push is starting, before the flag has had a chance to flip.
 const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
-
-// How often to refresh the cached operator (see queryCurrentOperator()) -
-// it blocks on two AT commands (up to 20s combined) of connected time on
-// every report, but the actual operator essentially never changes between
-// reports, so paying that cost every single cycle burns battery for very
-// little benefit. Once a day is plenty to catch a real operator change.
-const unsigned long OPERATOR_QUERY_INTERVAL_MS =
-    48UL * 60 * 60 * 1000; // 48 hours
 
 static float readBatteryVoltage() {
   const pin_t VBAT_MEAS_PIN = A0;
@@ -233,102 +226,60 @@ int atCallback(int type, const char *buf, int len, void *data) {
   return WAIT;
 }
 
-// Full airtime scan: lists every operator the modem can see and whether
-// this SIM is allowed on it. On the msom/EG91 board this was empirically
-// what got the modem to register after it sat at Cellular.ready=0 for a
-// long time; not yet verified whether SARA-R510 needs the same nudge.
-// Expensive (1-3 minutes, lots of current) - only used as a fallback when
-// the known-operator shortcut below doesn't pan out.
-void scanNetworks() {
-  Cellular.on();
-  Log.info("Scanning for available networks, this takes 1-3 minutes...");
-  Cellular.command(atCallback, (void *)nullptr, 180000, "AT+COPS=?\r\n");
-}
-
 retained uint32_t g_cloudConnectAttemptsCount = 0;
 retained uint32_t g_cloudConnectSuccesses = 0;
 
-// ULTRA_LOW_POWER doesn't lose RAM anyway, but `retained` also protects this
-// across an actual reset (manual reset, watchdog, power loss/recovery) so
-// we can skip straight to the operator that worked last time instead of
-// paying for a full scan. Zero-initialized on first-ever cold boot.
-retained char g_lastOperatorNumeric[8] = {}; // MCC+MNC, e.g. "28201"
-
-void saveOperator(const char *numeric) {
-  strncpy(g_lastOperatorNumeric, numeric, sizeof(g_lastOperatorNumeric) - 1);
-  g_lastOperatorNumeric[sizeof(g_lastOperatorNumeric) - 1] = '\0';
-}
-
-// Returns true and fills outNumeric if retained memory holds a plausible
-// MCC+MNC value.
-bool loadOperator(char *outNumeric, size_t outSize) {
-  size_t len = strnlen(g_lastOperatorNumeric, sizeof(g_lastOperatorNumeric));
-  if (len < 5 || len > 6) {
-    return false;
-  }
-  for (size_t i = 0; i < len; i++) {
-    if (!isdigit((unsigned char)g_lastOperatorNumeric[i])) {
-      return false;
+// Cellular.command() hands each reply line to a callback rather than
+// returning it, so pull the one field we need - <mode> out of
+// "+COPS: <mode>,<format>,<oper>,<AcT>" - in place, and return it through
+// the context pointer. Matching on the "+COPS:" prefix rather than the
+// whole line keeps this indifferent to leading CRLF and to a URC sharing
+// the reply. Left untouched (so, negative) when no such line arrives, which
+// the caller reads as "no answer".
+int copsModeCallback(int type, const char *buf, int len, int *mode) {
+  if (buf && mode) {
+    const char *cops = strstr(buf, "+COPS:");
+    if (cops) {
+      sscanf(cops, "+COPS: %d", mode);
     }
-  }
-  strncpy(outNumeric, g_lastOperatorNumeric, outSize - 1);
-  outNumeric[outSize - 1] = '\0';
-  return true;
-}
-
-// Skip the full scan: force the modem to register directly on the operator
-// that worked last time. Much faster/cheaper than searching all operators.
-void tryKnownOperator(const char *numeric) {
-  Cellular.on();
-  Log.info("Trying known operator %s...", numeric);
-  // Manual AT+COPS registration is documented at up to 3 min worst case
-  // (same as the fallback scan) - a shorter timeout here would let us give
-  // up on this command while the modem might still be mid-registration.
-  Cellular.command(atCallback, (void *)nullptr, 180000,
-                   "AT+COPS=1,2,\"%s\"\r\n", numeric);
-}
-
-// Accumulates AT command response text into a buffer for parsing, instead
-// of just logging it.
-char atResponseBuf[256];
-size_t atResponseLen = 0;
-
-int captureCallback(int type, const char *buf, int len, void *data) {
-  if (buf && atResponseLen + len < sizeof(atResponseBuf) - 1) {
-    memcpy(atResponseBuf + atResponseLen, buf, len);
-    atResponseLen += len;
-    atResponseBuf[atResponseLen] = '\0';
   }
   return WAIT;
 }
 
-// Parses the numeric MCC+MNC out of "+COPS: 0,2,"28201",7" so it can be saved.
-bool queryCurrentOperator(char *outNumeric, size_t outSize) {
-  atResponseLen = 0;
-  atResponseBuf[0] = '\0';
-  // AT+COPS? reports <oper> in whichever <format> was last active, which
-  // may not be numeric if this connection came from the scanNetworks()
-  // fallback path instead of tryKnownOperator(). Force numeric format
-  // first (mode=3: set only <format>) so the parsing below is reliable.
-  Cellular.command(atCallback, (void *)nullptr, 10000, "AT+COPS=3,2\r\n");
-  Cellular.command(captureCallback, (void *)nullptr, 10000, "AT+COPS?\r\n");
+// Migration cleanup for devices that ran a build which pinned the modem to
+// one operator with AT+COPS=1. Device OS will not undo that on its own:
+// SaraNcpClient::registerNet() only restores automatic selection when the
+// modem reports mode 2 (deregistered), gated on
+// `if (copsState != 0 && copsState != 1)` with the comment "Only run
+// AT+COPS=0 if currently de-registered, to avoid PLMN reselection". Manual
+// mode is deliberately left alone, so a modem left pinned to a PLMN that
+// has since gone marginal stays pinned right through an OTA.
+//
+// Reading the mode is one fast command that never triggers a network
+// search; the write is only issued when manual mode is actually found.
+// Delete this once no device in the field can still be running a build
+// that set AT+COPS=1.
+//
+// Returns true once the modem has given a definitive answer that it is not
+// in manual mode, so the caller can stop asking for good. Everything else -
+// an unparsable read, or a read that did find manual mode - returns false
+// and gets retried on a later session: the write's success doesn't need
+// checking, because if it didn't take, the next read still reports mode 1.
+bool restoreAutomaticOperatorSelection() {
+  int mode = -1;
+  Cellular.command(copsModeCallback, &mode, 10000, "AT+COPS?\r\n");
 
-  const char *start = strchr(atResponseBuf, '"');
-  if (!start) {
-    return false;
+  if (mode < 0) {
+    return false; // no answer - ask again next session
   }
-  start++;
-  const char *end = strchr(start, '"');
-  if (!end) {
-    return false;
+  if (mode != 1) {
+    return true; // definitively not manual, nothing left to do
   }
-  size_t len = end - start;
-  if (len == 0 || len >= outSize) {
-    return false;
-  }
-  memcpy(outNumeric, start, len);
-  outNumeric[len] = '\0';
-  return true;
+  Log.warn("Modem is in manual operator selection, restoring automatic");
+  // Device OS allows 5 minutes for this one (UBLOX_COPS_TIMEOUT), noting
+  // that u-blox modems overrun the AT manual's documented 3 min.
+  Cellular.command(atCallback, (void *)nullptr, 300000, "AT+COPS=0,2\r\n");
+  return false;
 }
 
 // Particle.publish() returns a Future<bool> - queued/sent is not the same
@@ -500,8 +451,8 @@ void drainReedQueue() {
 // disablePsmEdrx() upstream), so standby never gets below that ~9mA floor.
 // For a report cadence of a few times a day, 9mA continuously between
 // reports costs far more energy than fully powering the modem off and
-// paying for a cold re-attach (already handled by tryKnownOperator() /
-// scanNetworks() below) each time there's actually something to report.
+// paying for a cold re-attach (handled entirely by Device OS's own
+// registration) each time there's actually something to report.
 void sleepWithCellularOff() {
   Cellular.off();
   // Cellular.off() is asynchronous - it dispatches the actual power-down
@@ -601,8 +552,14 @@ void setup() {
 
 // loop() runs over and over again, as quickly as it can execute.
 void loop() {
-  static bool triedKnownOperator = false;
-  static bool triedFullScan = false;
+  // Cleared per reporting session, so the modem is asked at most once per
+  // session but a read that didn't come back still gets another chance.
+  static bool checkedOperatorMode = false;
+  // Latched for good the first time the modem answers that it is not in
+  // manual operator selection - nothing in this firmware can put it back,
+  // so from then on there is nothing left to check. Deliberately not reset
+  // when a new session begins.
+  static bool operatorModeSettled = false;
   static bool firmwareInfoPublished = false;
   static unsigned long wakeStart = millis();
   static bool telemetryPublishedOnce = false;
@@ -611,16 +568,6 @@ void loop() {
   // itself is just a GPIO read (see readReedIsClosed()), so most wakes never
   // need to set this and go straight back to sleep without touching the radio.
   static bool reporting = false;
-  // Only refresh the cached operator once per loop() iteration within a
-  // session (queryCurrentOperator() blocks on two AT commands, up to 20s
-  // combined, which would otherwise keep re-running for as long as we sit
-  // here waiting out an in-flight OTA transfer below, competing with the
-  // modem for time it needs to actually receive the update) - AND only once
-  // every OPERATOR_QUERY_INTERVAL_MS overall, not on every single report
-  // (see OPERATOR_QUERY_INTERVAL_MS). Deliberately not reset when a new
-  // reporting session begins - this needs to persist across sessions.
-  static bool operatorQueriedOnce = false;
-  static unsigned long lastOperatorQueryMillis = 0;
   // Set the moment we notice an OTA transfer in progress, so we can bound
   // how long we're willing to wait for it (see MAX_OTA_WAIT_MS).
   static unsigned long otaWaitStart = 0;
@@ -668,8 +615,7 @@ void loop() {
 
     reporting = true;
     wakeStart = millis();
-    triedKnownOperator = false;
-    triedFullScan = false;
+    checkedOperatorMode = false;
     otaWaitStart = 0;
     reportDoneAt = 0;
     vBatIdle = readBatteryVoltage();
@@ -679,23 +625,16 @@ void loop() {
     Particle.connect();
   }
 
-  if (!Cellular.ready() && millis() - wakeStart > 5000) {
-    if (!triedKnownOperator) {
-      triedKnownOperator = true;
-      char numeric[8];
-      if (loadOperator(numeric, sizeof(numeric))) {
-        tryKnownOperator(numeric);
-      } else {
-        // Nothing saved yet (first-ever boot) - go straight to a full scan.
-        triedFullScan = true;
-        scanNetworks();
-      }
-    } else if (!triedFullScan &&
-               (millis() - wakeStart > MAX_CONNECT_WAIT_MS / 2)) {
-      // Known operator didn't pan out in time - fall back to a full scan.
-      triedFullScan = true;
-      scanNetworks();
-    }
+  // Registration itself is left entirely to Device OS, which escalates on
+  // its own (AT+COPS=0,2 PLMN reselection once registration goes sticky, an
+  // RF reset via CFUN cycling when it is denied, a modem reset at its
+  // 10-minute REGISTRATION_TIMEOUT). The only thing we do ourselves is the
+  // one-shot manual-selection cleanup below, held off for a few seconds so
+  // the modem is actually up before we talk to it directly.
+  if (!Cellular.ready() && !operatorModeSettled && !checkedOperatorMode &&
+      millis() - wakeStart > 5000) {
+    checkedOperatorMode = true;
+    operatorModeSettled = restoreAutomaticOperatorSelection();
   }
 
   if (Particle.connected()) {
@@ -759,27 +698,10 @@ void loop() {
       return;
     }
 
-    // Only refresh the cached operator once we're confident no OTA is
-    // landing (past the g_otaInProgress/linger checks above) - this blocks
-    // on two AT commands (up to 20s combined) sent directly to the modem,
-    // which would otherwise contend with it for the airtime/UART access an
-    // in-flight or about-to-start transfer needs. Also gated to once every
-    // OPERATOR_QUERY_INTERVAL_MS overall (see declaration above), not every
-    // single report.
-    if (!operatorQueriedOnce ||
-        (millis() - lastOperatorQueryMillis >= OPERATOR_QUERY_INTERVAL_MS)) {
-      operatorQueriedOnce = true;
-      lastOperatorQueryMillis = millis();
-      char numeric[8];
-      if (queryCurrentOperator(numeric, sizeof(numeric))) {
-        saveOperator(numeric);
-      }
-    }
-
     if (g_otaInProgress) {
-      // A transfer started during the AT commands above - let the
-      // g_otaInProgress branch above handle waiting it out on the next pass
-      // instead of disconnecting right on top of it.
+      // The system thread can set this at any point, including during the
+      // linger above - let the g_otaInProgress branch handle waiting it out
+      // on the next pass instead of disconnecting right on top of it.
       delay(500);
       return;
     }
