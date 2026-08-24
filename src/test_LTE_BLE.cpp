@@ -498,18 +498,7 @@ void sleepOrIdle() {
   pinMode(RGBR, INPUT);
   pinMode(RGBG, INPUT);
   pinMode(RGBB, INPUT);
-
-  // While testing remotely (flashing over Particle Cloud), full HIBERNATE
-  // leaves only a brief window where the device is actually reachable, and an
-  // OTA push can miss it or spill across several wake cycles. Keep this true
-  // during remote bring-up so the device stays connected and reflashes land
-  // instantly; flip to false for the real deployment cadence.
-  static const bool TESTING_MODE = false;
-  if (TESTING_MODE) {
-    delay(WAKE_INTERVAL_MS);
-  } else {
-    sleepWithCellularOff();
-  }
+  sleepWithCellularOff();
 }
 
 // We only stay connected for a few seconds per wake (see loop()), which
