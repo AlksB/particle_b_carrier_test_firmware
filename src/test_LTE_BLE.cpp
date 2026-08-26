@@ -229,6 +229,103 @@ static int atCallback(int type, const char *buf, int len, void *data) {
 static retained uint32_t g_cloudConnectAttemptsCount = 0;
 static retained uint32_t g_cloudConnectSuccesses = 0;
 
+// Modem-on time on this battery pack, split by phase, in milliseconds.
+//
+// Charge is spent per unit time, not per connect, and the two phases cost
+// very different amounts: searching and registering runs the transmitter
+// at high power in bursts, while a registered modem with the interface up
+// sits in the low milliamps. A cycle that gives up at MAX_CONNECT_WAIT_MS
+// burns eight minutes of the expensive kind, one that connects straight
+// away burns seconds of it, and g_cloudConnectAttemptsCount counts both as
+// 1 - which is why it only works as a charge proxy for as long as the
+// per-cycle radio cost stays close to what the calibration run saw. These
+// two are published alongside it (see publishTelemetry()) so the next
+// discharge run can be replayed against elapsed modem time instead.
+//
+// Same "on this pack" semantics as the connect counters above, and for the
+// same reason: retained SRAM doesn't survive the power cut of a battery
+// swap. Milliseconds in 64 bits so nothing here has to reason about
+// wraparound - System.millis() is 64-bit too, unlike the global millis().
+static retained uint64_t g_modemSearchMs = 0; // powered, not registered yet
+static retained uint64_t g_modemReadyMs = 0;  // registered, interface up
+
+// Phase state behind the two counters above. Only ever touched from the
+// application thread - see networkStatusHandler() - but volatile because
+// the handler runs from the thread's async queue, which is pumped from
+// inside delay()/Particle.process()/Future::wait() as well as between
+// loop() iterations. So a phase can change part-way through a function
+// here, just not part-way through a statement.
+static volatile bool s_modemPowered = false;
+static volatile bool s_modemUp = false;
+static volatile uint64_t s_modemPhaseStartMs = 0;
+
+// Credits the time since the last phase change to the counter for the
+// phase we were in, then restarts the clock. Credits nothing when the
+// modem is off, so it's safe to call at any point.
+static void modemTimeAccrue(uint64_t now) {
+  if (s_modemPowered) {
+    uint64_t elapsed = now - s_modemPhaseStartMs;
+    if (s_modemUp) {
+      g_modemReadyMs += elapsed;
+    } else {
+      g_modemSearchMs += elapsed;
+    }
+  }
+  s_modemPhaseStartMs = now;
+}
+
+// Phases are tracked off Device OS's own network events rather than off
+// our Particle.connect()/Cellular.off() calls, so modem time that Device
+// OS spends on its own initiative gets counted too - the RF reset via CFUN
+// cycling when registration is denied, and the modem reset at its
+// 10-minute REGISTRATION_TIMEOUT, both power the modem without this
+// firmware asking for it.
+//
+// network_status_on/off are tied to the interface's real PHY state
+// (NetworkManager::handleIfPhyState in Device OS), i.e. to the modem
+// actually being powered, but they arrive after the powering_on/
+// powering_off transitions - and powering up is itself part of the cost,
+// so the clock starts at powering_on and keeps running through the
+// (~19s, see sleepWithCellularOff()) power-down until off arrives.
+//
+// Device OS re-dispatches system events onto the application thread
+// (system_notify_event_async() -> APPLICATION_THREAD_CONTEXT_ASYNC), so
+// this runs from that thread's queue rather than at the moment the event
+// fires - and the timestamp is taken when the handler runs, not when the
+// modem changed state. The queue is pumped often enough on the paths that
+// matter (loop()'s delay(1000) while connecting, the delay(50) off-wait in
+// sleepWithCellularOff()) that the lag is milliseconds. The one place it
+// isn't is restoreAutomaticOperatorSelection(), whose AT+COPS=0,2 can
+// block the application thread for minutes - time that would land in
+// whichever phase was current when it started. That write only ever runs
+// on the one-shot migration path, so it isn't worth complicating this for.
+static void networkStatusHandler(system_event_t event, int param) {
+  uint64_t now = System.millis();
+  switch (param) {
+  case network_status_powering_on:
+    modemTimeAccrue(now);
+    s_modemPowered = true;
+    s_modemUp = false;
+    break;
+  case network_status_connected:
+    modemTimeAccrue(now);
+    s_modemUp = true;
+    break;
+  case network_status_disconnecting:
+  case network_status_disconnected:
+    modemTimeAccrue(now);
+    s_modemUp = false;
+    break;
+  case network_status_off:
+    modemTimeAccrue(now);
+    s_modemPowered = false;
+    s_modemUp = false;
+    break;
+  default:
+    break;
+  }
+}
+
 // Cellular.command() hands each reply line to a callback rather than
 // returning it, so pull the one field we need - <mode> out of
 // "+COPS: <mode>,<format>,<oper>,<AcT>" - in place, and return it through
@@ -333,23 +430,41 @@ static bool waitForPublish(particle::Future<bool> &result,
 // part: a device that keeps trying and failing burns far more battery than
 // one that connects first time, and that shows up here long before it shows
 // up as a missed report. Both are `retained` so a reset doesn't zero them.
+//
+// modemSearchSec/modemReadySec are the same story measured in time rather
+// than in cycles - see g_modemSearchMs. Nothing consumes them yet; they go
+// out so that the next full-discharge run logs them, which is what it
+// takes to replace batteryPercentEstimate()'s per-cycle constant with a
+// real mA-h budget (search and registered-idle carry very different
+// currents, so they're reported apart rather than summed).
 static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
                              float signalStrength, float signalQuality) {
   int batteryPercentage =
       batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
-  String payload = String::format(
-      "{"
-      "\"reedclosed\":%d,"
-      "\"battery\":%d,"
-      "\"vBatLoad\":%.3f,"
-      "\"vBatIdle\":%.3f,"
-      "\"signalStrength\":%.0f,"
-      "\"signalQuality\":%.0f,"
-      "\"connectAttempts\":%u,"
-      "\"connectSuccesses\":%u"
-      "}",
-      reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle, signalStrength,
-      signalQuality, g_cloudConnectAttemptsCount, g_cloudConnectSuccesses);
+  // Fold the session we're publishing from into the counters first, so the
+  // numbers include this connect instead of lagging a report behind.
+  // Nothing between the accrual and the reads pumps the application
+  // thread's queue, so networkStatusHandler() can't land in the middle and
+  // no locking is needed - keep it that way if anything is inserted here.
+  modemTimeAccrue(System.millis());
+  uint32_t modemSearchSec = (uint32_t)(g_modemSearchMs / 1000);
+  uint32_t modemReadySec = (uint32_t)(g_modemReadyMs / 1000);
+  String payload =
+      String::format("{"
+                     "\"reedclosed\":%d,"
+                     "\"battery\":%d,"
+                     "\"vBatLoad\":%.3f,"
+                     "\"vBatIdle\":%.3f,"
+                     "\"signalStrength\":%.0f,"
+                     "\"signalQuality\":%.0f,"
+                     "\"connectAttempts\":%u,"
+                     "\"connectSuccesses\":%u,"
+                     "\"modemSearchSec\":%u,"
+                     "\"modemReadySec\":%u"
+                     "}",
+                     reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle,
+                     signalStrength, signalQuality, g_cloudConnectAttemptsCount,
+                     g_cloudConnectSuccesses, modemSearchSec, modemReadySec);
   particle::Future<bool> result =
       Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
@@ -474,6 +589,16 @@ static void sleepWithCellularOff() {
   if (!Cellular.isOff()) {
     Log.info("Cellular didn't confirm off within timeout, sleeping anyway");
   }
+  // Stop the modem clock before sleeping. On the normal path the
+  // network_status_off event has already stopped it during the wait above;
+  // this covers the timeout path, where that event hasn't arrived and the
+  // clock would otherwise keep running across the entire sleep window and
+  // credit all of it to the modem. Under-counting a modem that really did
+  // stay powered is the cheaper error of the two - it shows up as current
+  // draw either way.
+  modemTimeAccrue(System.millis());
+  s_modemPowered = false;
+  s_modemUp = false;
   SystemSleepConfiguration sleepConfig;
   sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER).duration(WAKE_INTERVAL_MS);
   SystemSleepResult result = System.sleep(sleepConfig);
@@ -526,6 +651,7 @@ void setup() {
   Log.info("Firmware version=%d commit=%s", FIRMWARE_VERSION, GIT_COMMIT_SHA);
 
   System.on(firmware_update, firmwareUpdateHandler);
+  System.on(network_status, networkStatusHandler);
 
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
