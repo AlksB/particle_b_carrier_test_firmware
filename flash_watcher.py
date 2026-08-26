@@ -13,12 +13,17 @@ during its window - possibly most of the way through it, leaving too little
 time for a transfer to land. The cloud's `online` flag is useless here for the
 same reason plus lag: it can read true for a device that has already gone.
 
+By default one successful `particle flash` ends the run - the point is to get
+the binary onto the device.
+
 `Flash success!` from the CLI only means the cloud queued the request, not that
-the device took it, so this re-checks the reported firmware version afterwards.
-If the version didn't move, the next online event triggers another attempt, up
-to --max-attempts.
+the device took it. When you pass --expect-version, the reported firmware
+version is re-checked afterwards, and if it didn't move the next online event
+triggers another attempt, up to --max-attempts. Without it there is nothing to
+confirm against, so the version is only printed for information.
 
 Usage:
+  ./flash_watcher.py <device_id> <binary.bin>
   ./flash_watcher.py <device_id> <binary.bin> --expect-version 20
 """
 
@@ -108,7 +113,8 @@ def main():
     ap.add_argument("device_id")
     ap.add_argument("binary")
     ap.add_argument("--expect-version", default=None,
-                    help="stop once the device reports this firmware version")
+                    help="keep retrying until the device reports this firmware "
+                         "version; without it a successful flash ends the run")
     ap.add_argument("--max-attempts", type=int, default=5)
     ap.add_argument("--settle", type=int, default=25,
                     help="seconds to wait before re-reading the version")
@@ -145,17 +151,26 @@ def main():
                 ts = time.strftime("%H:%M:%S")
                 print(f"[{ts}] spark/status online (published {published_at})", flush=True)
                 print(f"[попытка {attempts}/{args.max_attempts}]", flush=True)
-                do_flash(args.device_id, args.binary)
+                ok = do_flash(args.device_id, args.binary)
 
-                time.sleep(args.settle)  # transfer lands, device reboots
-                got = reported_version(token, args.device_id)
-                print(f"  устройство рапортует firmware_version={got}", flush=True)
-                if args.expect_version and str(got) == str(args.expect_version):
-                    print("готово: версия совпала")
-                    return
+                if ok:
+                    time.sleep(args.settle)  # transfer lands, device reboots
+                    got = reported_version(token, args.device_id)
+                    print(f"  устройство рапортует firmware_version={got}", flush=True)
+                    if not args.expect_version:
+                        # Nothing to verify against - the binary is sent, done.
+                        print("готово: бинарник отправлен")
+                        return
+                    if str(got) == str(args.expect_version):
+                        print("готово: версия совпала")
+                        return
+                    reason = "версия не сдвинулась"
+                else:
+                    reason = "particle flash не прошёл"
+
                 if attempts >= args.max_attempts:
                     break
-                print("  версия не сдвинулась - жду следующего online", flush=True)
+                print(f"  {reason} - жду следующего online", flush=True)
         except urllib.error.HTTPError as e:
             # Auth/permission/not-found won't fix themselves - reconnecting in a
             # loop would just spin forever printing the same line.
@@ -165,7 +180,9 @@ def main():
             print(f"  (поток оборвался: {e} - переподключаюсь)", flush=True)
             time.sleep(3)
 
-    print(f"исчерпано {args.max_attempts} попыток - версия так и не подтвердилась")
+    tail = ("версия так и не подтвердилась" if args.expect_version
+            else "прошивка так и не ушла")
+    print(f"исчерпано {args.max_attempts} попыток - {tail}")
     sys.exit(1)
 
 
