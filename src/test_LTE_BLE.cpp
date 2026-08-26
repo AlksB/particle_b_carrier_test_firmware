@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 23;
+const int FIRMWARE_VERSION = 24;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -24,35 +24,44 @@ PRODUCT_VERSION(FIRMWARE_VERSION)
 // View logs with CLI using 'particle serial monitor --follow'
 static SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
-// The internal pull-up is ~13k typ on nRF52840, so leaving it enabled all
-// the time would burn ~VDD/13k =~ 250uA continuously whenever the reed
-// switch is closed - far more than anything we saved by sleeping. We only
-// poll once a minute, so enable the pull-up, sample, then disable it again
-// immediately rather than leaving it on between polls.
-static bool readReedIsClosed() {
-  static const pin_t REED_PIN = D6;
-  pinMode(REED_PIN, INPUT_PULLUP);
-  delayMicroseconds(1000); // let the line settle before sampling
-  bool state = !digitalRead(REED_PIN);
-  pinMode(REED_PIN, INPUT); // no pull - stop burning current until next poll
-  return state;
-}
+// Reed switch input. It shorts the pin to GND when closed, so the reading
+// is an active-low one against the internal pull-up.
+//
+// That pull-up (~13k typ on nRF52840, so ~VDD/13k =~ 250uA while the reed is
+// closed) now stays enabled continuously instead of being switched on around
+// each sample. The pin doubles as a sleep wake source - see
+// sleepWithCellularOff() - and the nRF52840's GPIO SENSE/DETECT logic needs a
+// defined level on the pin for the whole sleep window to fire at all, which
+// is the entire time between polls. Toggling the pull-up around the sample
+// would therefore save nothing and just break the wake, so the ~250uA is the
+// standing price of reporting transitions the moment they happen rather than
+// up to WAKE_INTERVAL_MS later.
+static const pin_t REED_PIN = D6;
 
-// How long to sleep between wake cycles - every wake, the reed switch gets
-// polled (and reed_changed fires immediately if it flipped since last time).
+static bool readReedIsClosed() { return !digitalRead(REED_PIN); }
+
+// Upper bound on how long we stay asleep with nothing to do. A reed
+// transition wakes us immediately (see sleepWithCellularOff()), so this is
+// only the fallback cadence: it re-polls the switch in case an edge was ever
+// missed, and it's what paces the telemetry check below.
 const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
-// If we can't get connected within this long on a given wake, give up for
-// this cycle and try again next wake instead of draining the battery.
-// Nothing in the connect path blocks for long any more - the only AT
-// command we send ourselves is a fast +COPS read - so this budget is
-// honoured as written, unlike when a 180s scan could overrun it. Note that
-// Device OS gives up at its own REGISTRATION_TIMEOUT of 10 minutes, where
-// it resets the modem as a last resort: anything shorter here means we
-// never let it get that far.
-const unsigned long MAX_CONNECT_WAIT_MS = 8UL * 60 * 1000; // 8 minutes
+const unsigned long TELEMETRY_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+// How long a single connect attempt gets before we power-cycle the modem and
+// start a fresh one. We no longer give up and sleep on a failed connect (see
+// loop()) - as long as something is queued to report, attempts just keep
+// coming - so this is a per-attempt budget, not a per-wake one.
+//
+// It sits deliberately above Device OS's own REGISTRATION_TIMEOUT of 10
+// minutes, at which it resets the modem as a last resort. Its escalation
+// ladder (AT+COPS=0,2 PLMN reselection once registration goes sticky, an RF
+// reset via CFUN cycling when it is denied, then that modem reset) is
+// strictly better informed than our blunt power-cycle, so we let it run to
+// the end before starting over ourselves. Nothing in the connect path blocks
+// for long on our side - the only AT command we send ourselves is a fast
+// +COPS read - so this budget is honoured as written.
+const unsigned long MAX_CONNECT_WAIT_MS = 12UL * 60 * 1000; // 12 minutes
 
 // Safety cap on how long loop() will hold the connection open for an
 // in-flight OTA transfer (see g_otaInProgress below). The binary itself is
@@ -570,25 +579,32 @@ static void drainReedQueue() {
 // reports costs far more energy than fully powering the modem off and
 // paying for a cold re-attach (handled entirely by Device OS's own
 // registration) each time there's actually something to report.
-static void sleepWithCellularOff() {
-  Cellular.off();
-  // Cellular.off() is asynchronous - it dispatches the actual power-down
-  // (including toggling the modem's UBPWR/UBRST pins) to the system thread
-  // and returns immediately. System.sleep() halts the system thread
-  // entirely for the sleep duration, so without waiting here we could
-  // freeze that power-down sequence mid-way, leaving the modem in an
-  // inconsistent state that breaks the next Cellular.on()/reconnect.
-  // Observed via serial log: the async power-down consistently takes close
-  // to 19s in practice (mux teardown completing ~9s after a 10s wait gave
-  // up, twice in a row) - 25s gives real margin instead of routinely
-  // hitting the fallback below.
+// Cellular.off() is asynchronous - it dispatches the actual power-down
+// (including toggling the modem's UBPWR/UBRST pins) to the system thread and
+// returns immediately. Both callers need it to have finished before they go
+// on: System.sleep() halts the system thread entirely for the sleep
+// duration, and the connect-retry path in loop() would otherwise ask for the
+// modem back while it is still going down - either way the power-down
+// sequence gets frozen mid-way, leaving the modem in an inconsistent state
+// that breaks the next Cellular.on()/reconnect.
+//
+// Observed via serial log: the async power-down consistently takes close to
+// 19s in practice (mux teardown completing ~9s after a 10s wait gave up,
+// twice in a row) - 25s gives real margin instead of routinely hitting the
+// fallback below.
+static void waitForCellularOff() {
   unsigned long offWaitStart = millis();
   while (!Cellular.isOff() && millis() - offWaitStart < 25000) {
     delay(50);
   }
   if (!Cellular.isOff()) {
-    Log.info("Cellular didn't confirm off within timeout, sleeping anyway");
+    Log.info("Cellular didn't confirm off within timeout, continuing anyway");
   }
+}
+
+static void sleepWithCellularOff() {
+  Cellular.off();
+  waitForCellularOff();
   // Stop the modem clock before sleeping. On the normal path the
   // network_status_off event has already stopped it during the wait above;
   // this covers the timeout path, where that event hasn't arrived and the
@@ -600,14 +616,31 @@ static void sleepWithCellularOff() {
   s_modemPowered = false;
   s_modemUp = false;
   SystemSleepConfiguration sleepConfig;
-  sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER).duration(WAKE_INTERVAL_MS);
+  // Wake on either reed edge as well as on the timer, so a transition is
+  // reported the moment it happens instead of waiting out the rest of the
+  // sleep window. CHANGE covers both directions - open and close are equally
+  // worth reporting - and the pin keeps its INPUT_PULLUP from setup() right
+  // through sleep, which is what makes the nRF52840's DETECT logic able to
+  // see the edge at all (see REED_PIN). The duration stays as the fallback:
+  // it re-polls the switch in case an edge was ever missed and it's what
+  // paces telemetry.
+  sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
+      .duration(WAKE_INTERVAL_MS)
+      .gpio(REED_PIN, CHANGE);
   SystemSleepResult result = System.sleep(sleepConfig);
   Log.info("Woke from sleep, reason=%d error=%d", (int)result.wakeupReason(),
            (int)result.error());
   if (result.error() != SYSTEM_ERROR_NONE) {
     // Sleep didn't actually happen (e.g. unexpectedly unsupported config) -
     // fall back to a plain wait instead of spinning the loop with no pacing.
-    delay(WAKE_INTERVAL_MS);
+    // Poll the reed while waiting and cut the wait short on a transition, so
+    // this path reports just as promptly as the GPIO wake above would have.
+    bool reedAtWaitStart = readReedIsClosed();
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < WAKE_INTERVAL_MS &&
+           readReedIsClosed() == reedAtWaitStart) {
+      delay(50);
+    }
   }
 }
 
@@ -652,6 +685,10 @@ void setup() {
 
   System.on(firmware_update, firmwareUpdateHandler);
   System.on(network_status, networkStatusHandler);
+
+  // Enabled once and left on for good - the sleep wake source needs it (see
+  // REED_PIN).
+  pinMode(REED_PIN, INPUT_PULLUP);
 
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
@@ -845,11 +882,38 @@ void loop() {
     reporting = false;
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
-    // Couldn't connect this cycle - don't drain the battery waiting, try again
-    // next wake.
-    Log.info("Giving up on connecting this cycle");
-    reporting = false;
-    sleepOrIdle();
+    // This attempt is out of budget, but we don't give up on the session:
+    // there is something queued to report, and it keeps being retried until
+    // it lands. So power-cycle the modem and start a fresh attempt right
+    // here rather than sleeping until the next wake - `reporting` stays set,
+    // so nothing below re-evaluates whether there's work to do.
+    //
+    // Cellular.off() (rather than just calling Particle.connect() again) is
+    // what makes this a real retry: by now Device OS has been through its
+    // whole escalation ladder, ending in its own modem reset, so the only
+    // thing left that we can change is to bring the modem up cold from
+    // power-off and have registration start over from nothing.
+    //
+    // This does mean a device that cannot register keeps the modem powered
+    // indefinitely instead of falling back to a 60s-duty-cycled retry, which
+    // costs materially more battery in exactly the situation where the
+    // device is already in trouble. That's the explicit trade requested:
+    // transitions land as soon as coverage comes back.
+    Log.info("Connect attempt timed out after %lu ms - power-cycling the "
+             "modem and retrying",
+             millis() - wakeStart);
+    Particle.disconnect(CloudDisconnectOptions().clearSession(true));
+    Cellular.off();
+    waitForCellularOff();
+    // Counted like any other attempt: each one burns real charge, which is
+    // the whole point of the counter (see batteryPercentEstimate()).
+    g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX
+                                      ? UINT32_MAX
+                                      : g_cloudConnectAttemptsCount + 1;
+    // Fresh modem, so the one-shot operator-mode check gets another go too.
+    checkedOperatorMode = false;
+    wakeStart = millis();
+    Particle.connect();
   } else {
     delay(1000);
   }
