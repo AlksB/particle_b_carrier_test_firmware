@@ -426,11 +426,12 @@ static bool waitForPublish(particle::Future<bool> &result,
 // counter goes in as well - see batteryPercentEstimate() for how it breaks
 // the flat top of the discharge curve.
 //
-// signalStrength/signalQuality duplicate what Particle.publishVitals() (see
-// loop()) already reports. That duplication is deliberate: vitals arrive as
-// a separate system event that the Ubidots integration can't fold into the
-// same webhook, and one event with everything in it beats two integrations
-// to maintain. Both are percentages, the same numbers the console shows.
+// signalStrength/signalQuality duplicate what the cloud-requested vitals
+// (see loop()) already report. That duplication is deliberate: vitals
+// arrive as a separate system event that the Ubidots integration can't fold
+// into the same webhook, and one event with everything in it beats two
+// integrations to maintain. Both are percentages, the same numbers the
+// console shows.
 // They come through as -1 when the modem can't report a level - passed on
 // as-is rather than suppressed, so the consumer sees a value it can filter.
 //
@@ -814,12 +815,22 @@ void loop() {
       CellularSignal sig = Cellular.RSSI();
       publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(),
                        sig.getQuality());
-      // Vitals aren't published automatically - Device OS's own periodic
-      // mode relies on a timer that only ticks while connected, which we
-      // aren't for long. Send one immediately each time telemetry goes out
-      // instead of trying to run a background schedule we can't sustain.
-      Particle.publishVitals(particle::NOW);
     }
+    // Nothing publishes vitals here on purpose. The cloud requests them
+    // itself on every full handshake - Device OS says so in as many words
+    // at system_cloud_internal.cpp:1316 ("Vitals are requested by DS only
+    // when full handshake is performed"), and it shows up in the serial log
+    // as "Received DESCRIBE request; flags: 0x04" (DESCRIBE_METRICS). The
+    // clearSession(true) below forces a full handshake on every single
+    // connect, so every session that gets this far already emits exactly
+    // one spark/device/diagnostics/update - whether this session was for
+    // telemetry, a reed transition, or both.
+    //
+    // An explicit Particle.publishVitals(NOW) used to sit inside the
+    // telemetry branch above and made it two per session, one of them
+    // redundant. If clearSession(true) ever goes away and sessions start
+    // resuming, the cloud stops asking and the explicit call has to come
+    // back - the two are coupled.
 
     if (g_otaInProgress) {
       if (otaWaitStart == 0) {
