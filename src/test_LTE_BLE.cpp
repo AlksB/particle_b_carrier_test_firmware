@@ -22,14 +22,14 @@ PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Show system, cloud connectivity, and application logs over USB
 // View logs with CLI using 'particle serial monitor --follow'
-SerialLogHandler logHandler(LOG_LEVEL_INFO);
+static SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // The internal pull-up is ~13k typ on nRF52840, so leaving it enabled all
 // the time would burn ~VDD/13k =~ 250uA continuously whenever the reed
 // switch is closed - far more than anything we saved by sleeping. We only
 // poll once a minute, so enable the pull-up, sample, then disable it again
 // immediately rather than leaving it on between polls.
-bool readReedIsClosed() {
+static bool readReedIsClosed() {
   static const pin_t REED_PIN = D6;
   pinMode(REED_PIN, INPUT_PULLUP);
   delayMicroseconds(1000); // let the line settle before sampling
@@ -107,7 +107,7 @@ static float readBatteryVoltage() {
 //
 // The pack died within an hour of reporting 2.96V, so the 2.90V floor is the
 // real cliff edge, not a theoretical cell cutoff.
-int batteryPercentFromVoltage(float vbat) {
+static int batteryPercentFromVoltage(float vbat) {
   // Pack voltage of 2xCR123A in series, exactly as readBatteryVoltage()
   // reports it - the calibration was done on the assembled pack, so per-cell
   // figures never enter into it.
@@ -196,7 +196,7 @@ int batteryPercentFromVoltage(float vbat) {
 // is ever swapped without the counters clearing, the in-band estimate reads
 // low (stale counter), but drops out of the picture as soon as the pack
 // leaves the band; the floor below keeps it from ever claiming near-dead.
-int batteryPercentEstimate(float vbat, uint32_t connectAttempts) {
+static int batteryPercentEstimate(float vbat, uint32_t connectAttempts) {
   // Connect cycles a pack delivers from fresh to death, from the
   // calibration run. Re-derive if the reporting cadence or the per-cycle
   // radio cost changes materially - it is "cycles", not hours.
@@ -219,15 +219,15 @@ int batteryPercentEstimate(float vbat, uint32_t connectAttempts) {
 }
 
 // Prints raw AT command responses as they arrive
-int atCallback(int type, const char *buf, int len, void *data) {
+static int atCallback(int type, const char *buf, int len, void *data) {
   if (buf) {
     Log.info("%.*s", len, buf);
   }
   return WAIT;
 }
 
-retained uint32_t g_cloudConnectAttemptsCount = 0;
-retained uint32_t g_cloudConnectSuccesses = 0;
+static retained uint32_t g_cloudConnectAttemptsCount = 0;
+static retained uint32_t g_cloudConnectSuccesses = 0;
 
 // Cellular.command() hands each reply line to a callback rather than
 // returning it, so pull the one field we need - <mode> out of
@@ -236,7 +236,7 @@ retained uint32_t g_cloudConnectSuccesses = 0;
 // whole line keeps this indifferent to leading CRLF and to a URC sharing
 // the reply. Left untouched (so, negative) when no such line arrives, which
 // the caller reads as "no answer".
-int copsModeCallback(int type, const char *buf, int len, int *mode) {
+static int copsModeCallback(int type, const char *buf, int len, int *mode) {
   if (buf && mode) {
     const char *cops = strstr(buf, "+COPS:");
     if (cops) {
@@ -265,7 +265,7 @@ int copsModeCallback(int type, const char *buf, int len, int *mode) {
 // an unparsable read, or a read that did find manual mode - returns false
 // and gets retried on a later session: the write's success doesn't need
 // checking, because if it didn't take, the next read still reports mode 1.
-bool restoreAutomaticOperatorSelection() {
+static bool restoreAutomaticOperatorSelection() {
   int mode = -1;
   Cellular.command(copsModeCallback, &mode, 10000, "AT+COPS?\r\n");
 
@@ -287,8 +287,8 @@ bool restoreAutomaticOperatorSelection() {
 // done or the timeout elapses; isSucceeded()/isFailed() on their own block
 // indefinitely if called before the future is actually done, so wait()
 // must be called first with an explicit positive timeout.
-bool waitForPublish(particle::Future<bool> &result, const char *eventName,
-                    const char *payload) {
+static bool waitForPublish(particle::Future<bool> &result,
+                           const char *eventName, const char *payload) {
   if (!result.wait(5000)) {
     Log.warn("Publish %s timed out waiting for ack: %s", eventName, payload);
     return false;
@@ -333,8 +333,8 @@ bool waitForPublish(particle::Future<bool> &result, const char *eventName,
 // part: a device that keeps trying and failing burns far more battery than
 // one that connects first time, and that shows up here long before it shows
 // up as a missed report. Both are `retained` so a reset doesn't zero them.
-void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
-                      float signalStrength, float signalQuality) {
+static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
+                             float signalStrength, float signalQuality) {
   int batteryPercentage =
       batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
   String payload = String::format(
@@ -362,7 +362,7 @@ void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
 // place (while we're still connected anyway) - this event is the one thing
 // in this firmware that genuinely needs to land, unlike telemetry. Returns
 // whether it was actually acknowledged by the cloud, not just attempted.
-bool publishReedChanged(bool reedClosed, time_t changedAt) {
+static bool publishReedChanged(bool reedClosed, time_t changedAt) {
   String payload =
       String::format("{\"reedclosed\":%d,\"timestamp\":\"%s\"}",
                      reedClosed ? 1 : 0, Time.timeStr(changedAt).c_str());
@@ -395,11 +395,13 @@ struct ReedTransition {
                     // drain time
 };
 const int REED_QUEUE_CAPACITY = 16;
-retained ReedTransition g_reedQueue[REED_QUEUE_CAPACITY];
-retained uint8_t g_reedQueueHead = 0;  // index of the oldest undelivered entry
-retained uint8_t g_reedQueueCount = 0; // number of entries currently queued
+static retained ReedTransition g_reedQueue[REED_QUEUE_CAPACITY];
+// Index of the oldest undelivered entry.
+static retained uint8_t g_reedQueueHead = 0;
+// Number of entries currently queued.
+static retained uint8_t g_reedQueueCount = 0;
 
-void enqueueReedTransition(bool state, time_t timestamp) {
+static void enqueueReedTransition(bool state, time_t timestamp) {
   if (g_reedQueueCount >= REED_QUEUE_CAPACITY) {
     // Pathological case (reed toggling faster than we can ever get a
     // connection window) - drop the oldest to bound memory and keep making
@@ -417,7 +419,7 @@ void enqueueReedTransition(bool state, time_t timestamp) {
 // Attempts to deliver every queued transition, oldest first, stopping (and
 // preserving order) at the first one that fails so it's retried - in
 // order - on a later wake instead of letting later entries jump ahead.
-void drainReedQueue() {
+static void drainReedQueue() {
   while (g_reedQueueCount > 0) {
     ReedTransition &t = g_reedQueue[g_reedQueueHead];
     time_t ts =
@@ -453,7 +455,7 @@ void drainReedQueue() {
 // reports costs far more energy than fully powering the modem off and
 // paying for a cold re-attach (handled entirely by Device OS's own
 // registration) each time there's actually something to report.
-void sleepWithCellularOff() {
+static void sleepWithCellularOff() {
   Cellular.off();
   // Cellular.off() is asynchronous - it dispatches the actual power-down
   // (including toggling the modem's UBPWR/UBRST pins) to the system thread
@@ -488,7 +490,7 @@ void sleepWithCellularOff() {
 // USB, dropping a local serial monitor) so remote development/flashing
 // stays as uninterrupted as possible. Otherwise sleeps for real; either way
 // nothing reboots, so the connect state below persists across cycles.
-void sleepOrIdle() {
+static void sleepOrIdle() {
   // LED off while asleep - both to save power and so a lit LED reliably
   // means "awake". Hi-Z (INPUT) rather than driving the "off" level: with
   // the pins detached there's no current path through the LED in either
@@ -507,9 +509,9 @@ void sleepOrIdle() {
 // disconnecting/sleeping while a transfer is actually in flight, so a
 // pending flash gets a real chance to finish instead of being cut off
 // wake after wake.
-volatile bool g_otaInProgress = false;
+static volatile bool g_otaInProgress = false;
 
-void firmwareUpdateHandler(system_event_t event, int param) {
+static void firmwareUpdateHandler(system_event_t event, int param) {
   if (param == firmware_update_begin || param == firmware_update_progress) {
     g_otaInProgress = true;
   } else if (param == firmware_update_complete ||
