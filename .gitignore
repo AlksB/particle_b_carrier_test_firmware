@@ -59,3 +59,6 @@ compile_commands.json
 
 # Generated per-build (git SHA), regenerate with gen-build-info.sh
 src/build_info.h
+
+# Python bytecode cache, left behind by flash_watcher.py
+__pycache__/
