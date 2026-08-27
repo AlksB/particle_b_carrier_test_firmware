@@ -17,4 +17,7 @@ DEVICE="$1"
 shift
 
 ./gen-build-info.sh
-particle flash "$DEVICE" ./src --target 6.4.1 "$@"
+# The project root, not ./src: pointing the CLI at src/ compiles the sources
+# but never reads project.properties, so the env=env.json line - and with it
+# the cellular band mask - would be silently dropped from the binary.
+particle flash "$DEVICE" . --target 6.4.1 "$@"
