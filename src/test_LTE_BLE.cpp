@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 26;
+const int FIRMWARE_VERSION = 27;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -44,10 +44,79 @@ static bool readReedIsClosed() { return !digitalRead(REED_PIN); }
 // transition wakes us immediately (see sleepWithCellularOff()), so this is
 // only the fallback cadence: it re-polls the switch in case an edge was ever
 // missed, and it's what paces the telemetry check below.
-const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
+
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
-// we poll the reed switch - sent once at boot, then on this cadence.
-const unsigned long TELEMETRY_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+// we poll the reed switch. It goes out on a fleet-wide slot grid rather than
+// on a timer relative to the last report (see currentTelemetrySlot()), which
+// buys two things that matter once there are thousands of these deployed:
+//
+//  - Every device has a known reporting time, so a missed report shows up on
+//    the back end within one period instead of via a "it has been quiet for a
+//    while" heuristic.
+//  - The grid is absolute, so an OTA rollout, a site-wide power-up or a
+//    recovery after an outage doesn't leave thousands of devices with their
+//    timers in phase, all reaching for the same cells at once. A boot-relative
+//    timer has exactly that failure mode: whatever restarts the fleet together
+//    also aligns it, and it stays aligned until the next restart.
+//
+// Slot boundaries are epoch-aligned: the Unix epoch starts at midnight UTC and
+// this period divides a day evenly, so they fall on 00/06/12/18 UTC.
+//
+// This is the one knob worth turning to watch the whole cycle on a bench -
+// drop it to a few minutes and every derived constant below follows it down on
+// its own, so a short period stays as coherent as the production one and there
+// is no debug build to remember to undo. Pick a divisor of 86400 to keep the
+// grid landing on round times of day; nothing breaks if you don't, the
+// boundaries just drift across the day.
+const uint32_t TELEMETRY_PERIOD_S = 6UL * 60 * 60;
+
+// Width of the window each device's own offset is drawn from. Wide enough that
+// a few thousand devices start their connects a couple per second rather than
+// together, narrow enough that "the reporting window" is still a specific half
+// hour for whoever is watching the fleet. Note that a slot is when a device
+// starts its connect, not when the event lands: registration takes anywhere
+// from seconds to MAX_CONNECT_WAIT_MS, so back-end alerting on a missed report
+// needs a tolerance in the tens of minutes, not in the minute the slot names.
+//
+// Clamped to the period, and that clamp is load-bearing rather than defensive.
+// currentTelemetrySlot() corrects by exactly one period when `now` hasn't
+// reached this device's offset yet, and that correction only lands inside the
+// current period while the offset is smaller than the period. Let the window
+// exceed it - which is what a period shortened for bench work would do against
+// a fixed 30 minutes - and every slot it computes sits in the future: reports
+// still come out roughly once per period, so it looks like it works, while the
+// grid underneath has quietly stopped meaning anything.
+const uint32_t TELEMETRY_WINDOW_TARGET_S = 30UL * 60;
+const uint32_t TELEMETRY_WINDOW_S =
+    TELEMETRY_WINDOW_TARGET_S < TELEMETRY_PERIOD_S ? TELEMETRY_WINDOW_TARGET_S
+                                                   : TELEMETRY_PERIOD_S;
+// Cadence used only while the clock has never been synced - a device that has
+// just been powered up has no idea where it sits in the grid until its first
+// cloud connection. Same period, just measured from the last report.
+const unsigned long TELEMETRY_INTERVAL_MS = TELEMETRY_PERIOD_S * 1000UL;
+
+// Attempts a telemetry report gets inside its own slot before it is dropped in
+// favour of the next one. Telemetry, unlike a reed transition, is not worth
+// chasing: the next slot's report carries the same fields, only fresher.
+const int TELEMETRY_MAX_ATTEMPTS = 3;
+// Gap between connect attempts, for telemetry and for reed delivery alike. The
+// modem is fully powered down in between (see sleepOrIdle()), which is half
+// the point - the other half is that nothing about a network that has just
+// refused us changes in the seconds after it did.
+//
+// Capped so that a slot's whole run of attempts still fits inside a period,
+// which is what makes "three tries, then wait for the next slot" mean anything.
+// At the production period the cap is nowhere near binding (6h/3 = 2h against
+// 15 minutes) and this is exactly the 15 minutes asked for; shorten the period
+// for bench work and the gap comes down with it instead of a single failure
+// swallowing five slots.
+const unsigned long RETRY_INTERVAL_TARGET_MS = 15UL * 60 * 1000; // 15 minutes
+const unsigned long RETRY_INTERVAL_CAP_MS =
+    TELEMETRY_INTERVAL_MS / TELEMETRY_MAX_ATTEMPTS;
+const unsigned long RETRY_INTERVAL_MS =
+    RETRY_INTERVAL_TARGET_MS < RETRY_INTERVAL_CAP_MS ? RETRY_INTERVAL_TARGET_MS
+                                                     : RETRY_INTERVAL_CAP_MS;
 // How long a single connect attempt gets before we power-cycle the modem and
 // start a fresh one. We no longer give up and sleep on a failed connect (see
 // loop()) - as long as something is queued to report, attempts just keep
@@ -498,9 +567,145 @@ static bool waitForPublish(particle::Future<bool> &result,
   return false;
 }
 
-// Sent once at boot and then on TELEMETRY_INTERVAL_MS - not on every reed
-// poll, which is far more frequent and only needs the radio when the state
-// actually changed.
+// Slot whose telemetry the cloud has actually acknowledged, and the slot the
+// attempt counter below belongs to. Both retained, along with the counter, so
+// that a reset doesn't hand a crash loop a fresh budget of attempts and
+// doesn't lose track of where in the grid we are. A battery swap cuts power
+// and clears them, which is the behaviour we want - a device that has just
+// been opened up should report.
+static retained time_t g_telemetrySlotSent = 0;
+static retained time_t g_telemetrySlotAttempted = 0;
+static retained uint8_t g_telemetryAttempts = 0;
+
+// Forces one telemetry report per boot, ahead of the slot grid and regardless
+// of what the retained bookkeeping above says about the current slot.
+//
+// Not retained, and nothing in the sleep path reboots - ULTRA_LOW_POWER
+// resumes execution rather than restarting (see sleepWithCellularOff()) - so
+// this is set exactly once per power-up or reset, not once per wake.
+//
+// It overrides the slot bookkeeping on purpose: after a reset mid-window we
+// report again even though that slot's report already landed. The duplicate
+// costs one event, and it is worth it - a reset is the one thing the fleet
+// cannot see from the outside, and "came back up at 09:04" is exactly the
+// datapoint that separates a brownout from a device that quietly died.
+static bool g_bootTelemetryPending = true;
+
+// Timestamp behind the no-clock fallback cadence (see telemetryOwed()). Not
+// retained: after a reset the boot report above re-establishes it anyway.
+static unsigned long g_lastTelemetryMillis = 0;
+
+// This device's fixed position inside the reporting window, in seconds.
+//
+// FNV-1a over the Device ID: no provisioning step and no coordination with the
+// cloud, yet the fleet spreads evenly across the window and each device keeps
+// the same second for life. That stability is the point - it is what makes
+// "this device reports at :17" something the back end can check, and what
+// stops the spread from collapsing after an OTA the way a random offset drawn
+// at boot would.
+//
+// Cached because System.deviceID() builds a String on every call and this is
+// consulted on every wake.
+static uint32_t telemetrySlotOffsetS() {
+  static uint32_t cached = UINT32_MAX; // never a real offset - see the modulo
+  if (cached == UINT32_MAX) {
+    String id = System.deviceID();
+    uint32_t hash = 2166136261u;
+    for (unsigned int i = 0; i < id.length(); i++) {
+      hash ^= (uint8_t)id[i];
+      hash *= 16777619u;
+    }
+    cached = hash % TELEMETRY_WINDOW_S;
+    Log.info("Telemetry slot: +%lus into each %lus window, period %lus",
+             (unsigned long)cached, (unsigned long)TELEMETRY_WINDOW_S,
+             (unsigned long)TELEMETRY_PERIOD_S);
+  }
+  return cached;
+}
+
+// The most recent moment this device was due to report, at or before `now`.
+//
+// Epoch arithmetic rather than Time.hour()/Time.minute(), which are shifted by
+// whatever Time.zone()/DST offset happens to be configured - the grid has to
+// be the same one fleet-wide, so it can only ever be UTC.
+static time_t currentTelemetrySlot(time_t now) {
+  uint32_t secs = (uint32_t)now;
+  time_t due = (time_t)(secs / TELEMETRY_PERIOD_S * TELEMETRY_PERIOD_S +
+                        telemetrySlotOffsetS());
+  if (now < due) {
+    // Past the period boundary but not yet at our offset within it, so the
+    // slot we are currently owed is still the previous one.
+    due -= (time_t)TELEMETRY_PERIOD_S;
+  }
+  return due;
+}
+
+// Whether a telemetry report is owed right now.
+//
+// The boot report comes first and answers before anything else is consulted -
+// a device that has just come up reports, whatever the grid says.
+//
+// After that: a device that has never had a valid clock (a fresh power-up that
+// hasn't reached the cloud yet) has no grid to sit on, so it falls back to the
+// boot-relative cadence until the first sync. That first report is itself what
+// gets it a clock, after which recordTelemetrySent() pins it to its slot.
+static bool telemetryOwed() {
+  if (g_bootTelemetryPending) {
+    return true;
+  }
+  if (!Time.isValid()) {
+    return millis() - g_lastTelemetryMillis >= TELEMETRY_INTERVAL_MS;
+  }
+  return currentTelemetrySlot(Time.now()) > g_telemetrySlotSent;
+}
+
+// Whether telemetry still has attempts left to spend on powering the modem up
+// for its own sake.
+//
+// While the clock is unsynced the budget doesn't apply: there is no next slot
+// to defer to, and a report is the very thing that would get us a clock. That
+// only ever matters on a device that has never once reached the cloud.
+//
+// The boot report draws on the same budget rather than getting its own. If it
+// burns all three it isn't dropped - g_bootTelemetryPending stays set, so it
+// goes out at the next slot, where telemetryBudgetRollover() has handed the
+// attempts back. It just stops keeping the modem busy in the meantime.
+static bool telemetryWithinBudget() {
+  return !Time.isValid() || g_telemetryAttempts < TELEMETRY_MAX_ATTEMPTS;
+}
+
+// Hands the attempt budget back when we roll into a new slot, so a slot that
+// was given up on doesn't leave the next one with nothing left to spend.
+static void telemetryBudgetRollover() {
+  if (!Time.isValid()) {
+    return; // no grid yet - telemetryWithinBudget() ignores the counter anyway
+  }
+  time_t slot = currentTelemetrySlot(Time.now());
+  if (slot != g_telemetrySlotAttempted) {
+    g_telemetrySlotAttempted = slot;
+    g_telemetryAttempts = 0;
+  }
+}
+
+// Marks the current slot as reported, and retires the boot report along with
+// it: whichever of the two this send was for, one report has now landed and
+// the next one is due at the next slot. Only called once the cloud has
+// actually acknowledged the publish - a report that timed out has to be
+// retried, which is the whole reason publishTelemetry() returns a bool.
+static void recordTelemetrySent() {
+  g_bootTelemetryPending = false;
+  g_lastTelemetryMillis = millis();
+  g_telemetryAttempts = 0;
+  if (Time.isValid()) {
+    g_telemetrySlotSent = currentTelemetrySlot(Time.now());
+  }
+}
+
+// Sent once at boot and then once per telemetry slot (see
+// currentTelemetrySlot()) - not on every reed poll, which is far more frequent
+// and only needs the radio when the state actually changed. Returns whether
+// the cloud acknowledged it: a report that wasn't acknowledged is still owed,
+// and the caller spends another of the slot's attempts on it.
 //
 // Both battery voltages go out because neither alone is enough. vBatIdle is
 // sampled at wake before the modem powers up, so it's close to open-circuit;
@@ -539,7 +744,12 @@ static bool waitForPublish(particle::Future<bool> &result,
 // real mA-h budget. They are reported apart rather than summed because
 // each is a different current regime: transmitter bursts while searching,
 // low milliamps once registered, and a detach that draws less than either.
-static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
+//
+// slotOffsetSec makes the schedule self-describing: it is this device's fixed
+// second within the reporting window (see telemetrySlotOffsetS()), so the back
+// end can say when the next report is due without re-implementing the hash
+// against the device ID and getting it subtly wrong.
+static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
                              float signalStrength, float signalQuality) {
   int batteryPercentage =
       batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
@@ -564,14 +774,15 @@ static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
       "\"connectSuccesses\":%u,"
       "\"modemSearchSec\":%u,"
       "\"modemReadySec\":%u,"
-      "\"modemOffgoingSec\":%u"
+      "\"modemOffgoingSec\":%u,"
+      "\"slotOffsetSec\":%u"
       "}",
       reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle, signalStrength,
       signalQuality, g_cloudConnectAttemptsCount, g_cloudConnectSuccesses,
-      modemSearchSec, modemReadySec, modemOffgoingSec);
+      modemSearchSec, modemReadySec, modemOffgoingSec, telemetrySlotOffsetS());
   particle::Future<bool> result =
       Particle.publish("telemetry", payload, PRIVATE);
-  waitForPublish(result, "telemetry", payload.c_str());
+  return waitForPublish(result, "telemetry", payload.c_str());
 }
 
 // Fired immediately (independent of the telemetry cadence) whenever the reed
@@ -581,6 +792,11 @@ static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
 // place (while we're still connected anyway) - this event is the one thing
 // in this firmware that genuinely needs to land, unlike telemetry. Returns
 // whether it was actually acknowledged by the cloud, not just attempted.
+//
+// These in-place retries are seconds apart and only cover a publish failing
+// on a connection we already have. Failing to get a connection at all is the
+// outer loop's problem: the entry stays queued and loop() opens a fresh
+// session every RETRY_INTERVAL_MS, with no cap, until this returns true.
 static bool publishReedChanged(bool reedClosed, time_t changedAt) {
   String payload =
       String::format("{\"reedclosed\":%d,\"timestamp\":\"%s\"}",
@@ -645,13 +861,26 @@ static void drainReedQueue() {
         (t.timestamp != 0) ? t.timestamp : (Time.isValid() ? Time.now() : 0);
     if (!publishReedChanged(t.state, ts)) {
       Log.warn("reed_changed queue drain stopped (%d entries left) - will "
-               "retry next wake",
-               (int)g_reedQueueCount);
+               "retry in %lu ms",
+               (int)g_reedQueueCount, RETRY_INTERVAL_MS);
       break;
     }
     g_reedQueueHead = (g_reedQueueHead + 1) % REED_QUEUE_CAPACITY;
     g_reedQueueCount--;
   }
+}
+
+// Whether anything is still waiting to go out that we are willing to power the
+// modem up for on its own.
+//
+// The two events are deliberately not equals here. A reed transition is the
+// one thing in this firmware that genuinely has to land, so it qualifies until
+// it does, however many attempts that takes. Telemetry only qualifies while
+// its slot still has attempts left; after that it waits for the next slot
+// rather than keeping the radio busy for a report that will be superseded in
+// six hours anyway.
+static bool reportPending() {
+  return g_reedQueueCount > 0 || (telemetryOwed() && telemetryWithinBudget());
 }
 
 // HIBERNATE would be the deepest option, but it requires an external RTC
@@ -795,9 +1024,14 @@ void setup() {
   // the exact binary that produced it. Note that waking from ULTRA_LOW_POWER
   // resumes rather than reboots, so this prints once per power-cycle or
   // reset - not once per wake.
-  Log.info("=== fw v%d commit=%s | Device OS %s | wake=%lums telemetry=%lums",
+  Log.info("=== fw v%d commit=%s | Device OS %s | wake=%lums telemetry=%lus "
+           "window=%lus retry=%lums",
            FIRMWARE_VERSION, GIT_COMMIT_SHA, System.version().c_str(),
-           WAKE_INTERVAL_MS, TELEMETRY_INTERVAL_MS);
+           WAKE_INTERVAL_MS, (unsigned long)TELEMETRY_PERIOD_S,
+           (unsigned long)TELEMETRY_WINDOW_S, RETRY_INTERVAL_MS);
+  // Logs this device's slot on the first call, so the offset a report is
+  // expected at is in the boot banner rather than only in the payload.
+  telemetrySlotOffsetS();
 
   System.on(firmware_update, firmwareUpdateHandler);
   System.on(network_status, networkStatusHandler);
@@ -832,8 +1066,13 @@ void loop() {
   static bool operatorModeSettled = false;
   static bool firmwareInfoPublished = false;
   static unsigned long wakeStart = millis();
-  static bool telemetryPublishedOnce = false;
-  static unsigned long lastTelemetryMillis = 0;
+  // Paces retries. Set when an attempt ends having left something
+  // undelivered, so the next one waits out RETRY_INTERVAL_MS with the modem
+  // off instead of starting straight away; cleared as soon as a wake finds
+  // nothing left to report, so the first attempt on genuinely new work is
+  // immediate rather than serving out a backoff it didn't earn.
+  static unsigned long lastAttemptEndMs = 0;
+  static bool retryGateArmed = false;
   // Whether this wake has already committed to connecting. Reed polling
   // itself is just a GPIO read (see readReedIsClosed()), so most wakes never
   // need to set this and go straight back to sleep without touching the radio.
@@ -872,13 +1111,27 @@ void loop() {
   }
 
   if (!reporting) {
-    bool reedPending = g_reedQueueCount > 0;
-    bool telemetryDue =
-        !telemetryPublishedOnce ||
-        (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS);
+    // Give the slot its attempts back first if we've rolled into a new one,
+    // so the budget check below sees the current slot's state, not the one
+    // we gave up on.
+    telemetryBudgetRollover();
 
-    if (!reedPending && !telemetryDue) {
+    if (!reportPending()) {
       // Nothing to report this wake - skip Cellular/cloud entirely.
+      retryGateArmed = false;
+      sleepOrIdle();
+      return;
+    }
+
+    if (retryGateArmed && millis() - lastAttemptEndMs < RETRY_INTERVAL_MS) {
+      // Still inside the gap after an attempt that left something behind.
+      //
+      // A transition that arrives in here waits for the scheduled retry
+      // rather than triggering one of its own: the network that refused us
+      // minutes ago is the same network now, and a chattering reed would
+      // otherwise hold the modem on continuously. It costs a transition up to
+      // RETRY_INTERVAL_MS of extra latency, but only ever one that lands
+      // while we are already failing to connect.
       sleepOrIdle();
       return;
     }
@@ -889,6 +1142,16 @@ void loop() {
     otaWaitStart = 0;
     reportDoneAt = 0;
     vBatIdle = readBatteryVoltage();
+    // Spend one of the slot's attempts if telemetry is part of why we're
+    // connecting. The budget check is what keeps a session opened purely for
+    // a reed transition from counting against a slot that has already given
+    // up - telemetry rides along on those for free (see below), but doesn't
+    // pay for them.
+    if (telemetryOwed() && g_telemetryAttempts < TELEMETRY_MAX_ATTEMPTS) {
+      g_telemetryAttempts++;
+      Log.info("Telemetry attempt %d/%d for this slot", (int)g_telemetryAttempts,
+               TELEMETRY_MAX_ATTEMPTS);
+    }
     g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX
                                       ? UINT32_MAX
                                       : g_cloudConnectAttemptsCount + 1;
@@ -925,17 +1188,25 @@ void loop() {
     // preserves order) at the first failure, retried next wake.
     drainReedQueue();
 
-    if (!telemetryPublishedOnce ||
-        (millis() - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS)) {
-      telemetryPublishedOnce = true;
-      lastTelemetryMillis = millis();
+    // telemetryOwed() rather than the budget-aware reportPending(): while
+    // we're connected the report is free, so a slot that has already spent
+    // its three attempts still gets sent if a reed transition happened to
+    // open a session. What the budget governs is powering the modem up for
+    // telemetry alone, not what we do once it is up.
+    if (telemetryOwed()) {
       // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
       // same as the plain-delay TESTING_MODE path), so setup() never re-runs
       // to give us a fresh reading - refresh it right before each send.
       float vBatLoad = readBatteryVoltage();
       CellularSignal sig = Cellular.RSSI();
-      publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(),
-                       sig.getQuality());
+      if (publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(),
+                           sig.getQuality())) {
+        recordTelemetrySent();
+      }
+      // A publish the cloud never acknowledged leaves the slot unreported on
+      // purpose. This attempt is already spent (counted when the session
+      // opened), so the next one comes in RETRY_INTERVAL_MS, or - once the
+      // budget is gone - in the next slot.
     }
     // Nothing publishes vitals here on purpose. The cloud requests them
     // itself on every full handshake - Device OS says so in as many words
@@ -1012,40 +1283,39 @@ void loop() {
                                   : g_cloudConnectSuccesses + 1;
     Particle.disconnect(CloudDisconnectOptions().clearSession(true));
     reporting = false;
+    // Arm the retry gate only if this session actually left something behind -
+    // a reed entry whose publish failed, or a telemetry report that wasn't
+    // acknowledged and still has attempts left. A session that got everything
+    // out leaves the gate open so the next transition connects immediately.
+    lastAttemptEndMs = millis();
+    retryGateArmed = reportPending();
     sleepOrIdle();
   } else if (millis() - wakeStart > MAX_CONNECT_WAIT_MS) {
-    // This attempt is out of budget, but we don't give up on the session:
-    // there is something queued to report, and it keeps being retried until
-    // it lands. So power-cycle the modem and start a fresh attempt right
-    // here rather than sleeping until the next wake - `reporting` stays set,
-    // so nothing below re-evaluates whether there's work to do.
+    // This attempt is out of budget. End it here and sleep, rather than
+    // power-cycling the modem and starting a fresh registration on the spot
+    // the way earlier builds did for as long as anything was queued.
     //
-    // Cellular.off() (rather than just calling Particle.connect() again) is
-    // what makes this a real retry: by now Device OS has been through its
-    // whole escalation ladder, ending in its own modem reset, so the only
-    // thing left that we can change is to bring the modem up cold from
-    // power-off and have registration start over from nothing.
-    //
-    // This does mean a device that cannot register keeps the modem powered
-    // indefinitely instead of falling back to a 60s-duty-cycled retry, which
-    // costs materially more battery in exactly the situation where the
-    // device is already in trouble. That's the explicit trade requested:
-    // transitions land as soon as coverage comes back.
-    Log.info("Connect attempt timed out after %lu ms - power-cycling the "
-             "modem and retrying",
-             millis() - wakeStart);
+    // That earlier behaviour was the right trade for a handful of devices -
+    // a transition landed the moment coverage came back - and the wrong one
+    // for a fleet of thousands. The failure that stops one device from
+    // registering is usually the one stopping its neighbours too, so
+    // answering an outage by holding every modem on continuously is both the
+    // most expensive possible response and the one that makes the recovery
+    // hardest, all of them hammering the cell the instant it returns.
+    // RETRY_INTERVAL_MS paces the next attempt instead, and sleepOrIdle()
+    // below powers the modem down (Cellular.off() plus the wait for it to
+    // confirm) on the way into sleep - which is also what makes that next
+    // attempt a genuinely cold registration rather than a continuation of
+    // the one that just failed. A reed transition still gets unlimited
+    // attempts; they are just spaced now.
+    Log.info("Connect attempt timed out after %lu ms - modem off, retrying in "
+             "%lu ms",
+             millis() - wakeStart, RETRY_INTERVAL_MS);
     Particle.disconnect(CloudDisconnectOptions().clearSession(true));
-    Cellular.off();
-    waitForCellularOff();
-    // Counted like any other attempt: each one burns real charge, which is
-    // the whole point of the counter (see batteryPercentEstimate()).
-    g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX
-                                      ? UINT32_MAX
-                                      : g_cloudConnectAttemptsCount + 1;
-    // Fresh modem, so the one-shot operator-mode check gets another go too.
-    checkedOperatorMode = false;
-    wakeStart = millis();
-    Particle.connect();
+    reporting = false;
+    lastAttemptEndMs = millis();
+    retryGateArmed = true;
+    sleepOrIdle();
   } else {
     delay(1000);
   }
