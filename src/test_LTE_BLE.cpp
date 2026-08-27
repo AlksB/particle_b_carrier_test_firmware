@@ -255,40 +255,113 @@ static retained uint32_t g_cloudConnectSuccesses = 0;
 // same reason: retained SRAM doesn't survive the power cut of a battery
 // swap. Milliseconds in 64 bits so nothing here has to reason about
 // wraparound - System.millis() is 64-bit too, unlike the global millis().
-static retained uint64_t g_modemSearchMs = 0; // powered, not registered yet
-static retained uint64_t g_modemReadyMs = 0;  // registered, interface up
+// Three phases, not two, because the teardown is neither of the others.
+// AT+CFUN=0 (the network detach) alone measures 17.4-19.8s in every single
+// session, and until it was split out it landed in the search bucket - on a
+// healthy cycle that made roughly two thirds of "searching" actually be the
+// modem shutting down, at nothing like search current. Fitting a search
+// current against that would have reproduced exactly the flaw this replaced.
+static retained uint64_t g_modemSearchMs = 0;   // powered, not registered yet
+static retained uint64_t g_modemReadyMs = 0;    // registered, interface up
+static retained uint64_t g_modemOffgoingMs = 0; // detaching and powering down
 
-// Phase state behind the two counters above. Only ever touched from the
+enum ModemPhase {
+  MODEM_OFF = 0,
+  MODEM_SEARCH,
+  MODEM_READY,
+  MODEM_OFFGOING,
+};
+
+// Phase state behind the counters above. Only ever touched from the
 // application thread - see networkStatusHandler() - but volatile because
 // the handler runs from the thread's async queue, which is pumped from
 // inside delay()/Particle.process()/Future::wait() as well as between
 // loop() iterations. So a phase can change part-way through a function
 // here, just not part-way through a statement.
-static volatile bool s_modemPowered = false;
-static volatile bool s_modemUp = false;
+static volatile ModemPhase s_modemPhase = MODEM_OFF;
 static volatile uint64_t s_modemPhaseStartMs = 0;
 
+static const char *modemPhaseName(ModemPhase phase) {
+  switch (phase) {
+  case MODEM_SEARCH:
+    return "search";
+  case MODEM_READY:
+    return "ready";
+  case MODEM_OFFGOING:
+    return "offgoing";
+  default:
+    return "off";
+  }
+}
+
 // Credits the time since the last phase change to the counter for the
-// phase we were in, then restarts the clock. Credits nothing when the
+// phase we were in, then restarts the clock. Credits nothing while the
 // modem is off, so it's safe to call at any point.
 static void modemTimeAccrue(uint64_t now) {
-  if (s_modemPowered) {
-    uint64_t elapsed = now - s_modemPhaseStartMs;
-    if (s_modemUp) {
-      g_modemReadyMs += elapsed;
-    } else {
-      g_modemSearchMs += elapsed;
-    }
+  uint64_t elapsed = now - s_modemPhaseStartMs;
+  switch (s_modemPhase) {
+  case MODEM_SEARCH:
+    g_modemSearchMs += elapsed;
+    break;
+  case MODEM_READY:
+    g_modemReadyMs += elapsed;
+    break;
+  case MODEM_OFFGOING:
+    g_modemOffgoingMs += elapsed;
+    break;
+  default:
+    break;
   }
   s_modemPhaseStartMs = now;
 }
 
-// Phases are tracked off Device OS's own network events rather than off
-// our Particle.connect()/Cellular.off() calls, so modem time that Device
-// OS spends on its own initiative gets counted too - the RF reset via CFUN
+// Closes the current phase, opens the next, and logs the transition.
+//
+// The log line exists to be lined up against an external current trace: the
+// timestamp Device OS prefixes to it is the boundary, and `event` names the
+// Device OS event that caused it, so a step in the current can be attributed
+// without guessing. The running totals are only printed on the way to OFF,
+// where the line costs nothing - every log call blocks until the USB CDC
+// write drains, and inside the connect path that time is itself being
+// measured.
+static void modemPhaseSet(uint64_t now, ModemPhase next, const char *event) {
+  ModemPhase prev = s_modemPhase;
+  uint64_t elapsed = now - s_modemPhaseStartMs;
+  modemTimeAccrue(now);
+  s_modemPhase = next;
+
+  if (prev == MODEM_OFF) {
+    Log.info("modem %s: -> %s", event, modemPhaseName(next));
+  } else if (next == MODEM_OFF) {
+    Log.info("modem %s: %s -> off (+%lu ms) | totals search=%lu ready=%lu "
+             "offgoing=%lu ms",
+             event, modemPhaseName(prev), (unsigned long)elapsed,
+             (unsigned long)g_modemSearchMs, (unsigned long)g_modemReadyMs,
+             (unsigned long)g_modemOffgoingMs);
+  } else {
+    Log.info("modem %s: %s -> %s (+%lu ms)", event, modemPhaseName(prev),
+             modemPhaseName(next), (unsigned long)elapsed);
+  }
+}
+
+// Phase changes we cause ourselves are stamped at the call site (see
+// Particle.connect() and Cellular.off() below); this handler covers the
+// ones Device OS makes on its own initiative - the RF reset via CFUN
 // cycling when registration is denied, and the modem reset at its
-// 10-minute REGISTRATION_TIMEOUT, both power the modem without this
-// firmware asking for it.
+// 10-minute REGISTRATION_TIMEOUT, both power the modem without being
+// asked - and acts as a fallback for the rest.
+//
+// It cannot be the primary source, because Device OS delivers these events
+// through the application thread's queue one per pump, and the queue is
+// pumped once per SPARK_LOOP_DELAY_MILLIS. A teardown emits four events
+// inside 16ms and they then arrive a second apart: measured on a real
+// session, powering_off was raised at 26184ms and handled at 32168ms, six
+// seconds late. Left to the events alone the offgoing bucket came out 32%
+// short with the difference credited to search - which is exactly the kind
+// of error these counters exist to avoid.
+//
+// Hence the guards below: a late event must never drag the phase backwards
+// out of one the call site has already set.
 //
 // network_status_on/off are tied to the interface's real PHY state
 // (NetworkManager::handleIfPhyState in Device OS), i.e. to the modem
@@ -297,38 +370,56 @@ static void modemTimeAccrue(uint64_t now) {
 // so the clock starts at powering_on and keeps running through the
 // (~19s, see sleepWithCellularOff()) power-down until off arrives.
 //
-// Device OS re-dispatches system events onto the application thread
-// (system_notify_event_async() -> APPLICATION_THREAD_CONTEXT_ASYNC), so
-// this runs from that thread's queue rather than at the moment the event
-// fires - and the timestamp is taken when the handler runs, not when the
-// modem changed state. The queue is pumped often enough on the paths that
-// matter (loop()'s delay(1000) while connecting, the delay(50) off-wait in
-// sleepWithCellularOff()) that the lag is milliseconds. The one place it
-// isn't is restoreAutomaticOperatorSelection(), whose AT+COPS=0,2 can
-// block the application thread for minutes - time that would land in
-// whichever phase was current when it started. That write only ever runs
-// on the one-shot migration path, so it isn't worth complicating this for.
+// network_status_connected has no call-site equivalent - only Device OS
+// knows when registration and PPP have actually completed - so it stays the
+// primary source for that one boundary. It is also the least affected: it
+// arrives on its own rather than in a burst, so the lag is one pump at most.
+//
+// The events that don't move a phase are still logged, because they are free
+// markers to line a current trace up against - network_status_on in
+// particular would be the moment the modem is genuinely powered, though on
+// this platform it never fires: Device OS only emits it while networkStatus_
+// is still POWERING_ON, and that state is left 3ms later, long before the
+// interface PHY comes up (system_network_manager.cpp).
 static void networkStatusHandler(system_event_t event, int param) {
   uint64_t now = System.millis();
   switch (param) {
   case network_status_powering_on:
-    modemTimeAccrue(now);
-    s_modemPowered = true;
-    s_modemUp = false;
+    // Fallback only: a connect we started stamps this at the call site, but
+    // Device OS also powers the modem on its own after a registration
+    // timeout, and that has to be caught somewhere.
+    if (s_modemPhase == MODEM_OFF) {
+      modemPhaseSet(now, MODEM_SEARCH, "powering_on");
+    }
     break;
   case network_status_connected:
-    modemTimeAccrue(now);
-    s_modemUp = true;
+    modemPhaseSet(now, MODEM_READY, "connected");
     break;
   case network_status_disconnecting:
-  case network_status_disconnected:
-    modemTimeAccrue(now);
-    s_modemUp = false;
+    // Genuinely means "back to searching" only when the link dropped on us.
+    // In a teardown it arrives after Cellular.off() has already moved us to
+    // offgoing, and must not undo that.
+    if (s_modemPhase == MODEM_READY) {
+      modemPhaseSet(now, MODEM_SEARCH, "disconnecting");
+    }
+    break;
+  case network_status_powering_off:
+    // Fallback: the teardown we start ourselves is stamped at Cellular.off().
+    if (s_modemPhase != MODEM_OFFGOING && s_modemPhase != MODEM_OFF) {
+      modemPhaseSet(now, MODEM_OFFGOING, "powering_off");
+    }
     break;
   case network_status_off:
-    modemTimeAccrue(now);
-    s_modemPowered = false;
-    s_modemUp = false;
+    modemPhaseSet(now, MODEM_OFF, "off");
+    break;
+  case network_status_on:
+    Log.info("modem on (interface powered)");
+    break;
+  case network_status_connecting:
+    Log.info("modem connecting");
+    break;
+  case network_status_disconnected:
+    Log.info("modem disconnected");
     break;
   default:
     break;
@@ -441,12 +532,13 @@ static bool waitForPublish(particle::Future<bool> &result,
 // one that connects first time, and that shows up here long before it shows
 // up as a missed report. Both are `retained` so a reset doesn't zero them.
 //
-// modemSearchSec/modemReadySec are the same story measured in time rather
+// The three modem*Sec fields are the same story measured in time rather
 // than in cycles - see g_modemSearchMs. Nothing consumes them yet; they go
 // out so that the next full-discharge run logs them, which is what it
 // takes to replace batteryPercentEstimate()'s per-cycle constant with a
-// real mA-h budget (search and registered-idle carry very different
-// currents, so they're reported apart rather than summed).
+// real mA-h budget. They are reported apart rather than summed because
+// each is a different current regime: transmitter bursts while searching,
+// low milliamps once registered, and a detach that draws less than either.
 static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
                              float signalStrength, float signalQuality) {
   int batteryPercentage =
@@ -459,22 +551,24 @@ static void publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   modemTimeAccrue(System.millis());
   uint32_t modemSearchSec = (uint32_t)(g_modemSearchMs / 1000);
   uint32_t modemReadySec = (uint32_t)(g_modemReadyMs / 1000);
-  String payload =
-      String::format("{"
-                     "\"reedclosed\":%d,"
-                     "\"battery\":%d,"
-                     "\"vBatLoad\":%.3f,"
-                     "\"vBatIdle\":%.3f,"
-                     "\"signalStrength\":%.0f,"
-                     "\"signalQuality\":%.0f,"
-                     "\"connectAttempts\":%u,"
-                     "\"connectSuccesses\":%u,"
-                     "\"modemSearchSec\":%u,"
-                     "\"modemReadySec\":%u"
-                     "}",
-                     reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle,
-                     signalStrength, signalQuality, g_cloudConnectAttemptsCount,
-                     g_cloudConnectSuccesses, modemSearchSec, modemReadySec);
+  uint32_t modemOffgoingSec = (uint32_t)(g_modemOffgoingMs / 1000);
+  String payload = String::format(
+      "{"
+      "\"reedclosed\":%d,"
+      "\"battery\":%d,"
+      "\"vBatLoad\":%.3f,"
+      "\"vBatIdle\":%.3f,"
+      "\"signalStrength\":%.0f,"
+      "\"signalQuality\":%.0f,"
+      "\"connectAttempts\":%u,"
+      "\"connectSuccesses\":%u,"
+      "\"modemSearchSec\":%u,"
+      "\"modemReadySec\":%u,"
+      "\"modemOffgoingSec\":%u"
+      "}",
+      reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle, signalStrength,
+      signalQuality, g_cloudConnectAttemptsCount, g_cloudConnectSuccesses,
+      modemSearchSec, modemReadySec, modemOffgoingSec);
   particle::Future<bool> result =
       Particle.publish("telemetry", payload, PRIVATE);
   waitForPublish(result, "telemetry", payload.c_str());
@@ -604,6 +698,14 @@ static void waitForCellularOff() {
 }
 
 static void sleepWithCellularOff() {
+  // Stamp the teardown here rather than waiting for network_status_powering_off
+  // to come back through the event queue - that arrives up to six seconds
+  // late (see networkStatusHandler()), and those seconds are the difference
+  // between the detach being counted as offgoing or as searching. This call
+  // is the moment the teardown starts, and we are on the thread that makes it.
+  if (s_modemPhase != MODEM_OFF) {
+    modemPhaseSet(System.millis(), MODEM_OFFGOING, "Cellular.off()");
+  }
   Cellular.off();
   waitForCellularOff();
   // Stop the modem clock before sleeping. On the normal path the
@@ -613,9 +715,9 @@ static void sleepWithCellularOff() {
   // credit all of it to the modem. Under-counting a modem that really did
   // stay powered is the cheaper error of the two - it shows up as current
   // draw either way.
-  modemTimeAccrue(System.millis());
-  s_modemPowered = false;
-  s_modemUp = false;
+  if (s_modemPhase != MODEM_OFF) {
+    modemPhaseSet(System.millis(), MODEM_OFF, "clamped at sleep");
+  }
   SystemSleepConfiguration sleepConfig;
   // Wake on either reed edge as well as on the timer, so a transition is
   // reported the moment it happens instead of waiting out the rest of the
@@ -628,6 +730,13 @@ static void sleepWithCellularOff() {
   sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .duration(WAKE_INTERVAL_MS)
       .gpio(REED_PIN, CHANGE);
+  // Brackets the microamp window for an external current trace: this is the
+  // last thing on the wire before the drop, and "Woke from sleep" below is
+  // the first thing after it. The short delay is what makes that true - the
+  // USB CDC write is still draining when System.sleep() would otherwise cut
+  // it off, and a truncated line is a lost boundary.
+  Log.info("sleeping up to %lu ms", WAKE_INTERVAL_MS);
+  delay(20);
   SystemSleepResult result = System.sleep(sleepConfig);
   Log.info("Woke from sleep, reason=%d error=%d", (int)result.wakeupReason(),
            (int)result.error());
@@ -682,7 +791,13 @@ static void firmwareUpdateHandler(system_event_t event, int param) {
 
 // setup() runs once, when the device is first turned on
 void setup() {
-  Log.info("Firmware version=%d commit=%s", FIRMWARE_VERSION, GIT_COMMIT_SHA);
+  // First line on the wire after a real boot, so a log file can be tied to
+  // the exact binary that produced it. Note that waking from ULTRA_LOW_POWER
+  // resumes rather than reboots, so this prints once per power-cycle or
+  // reset - not once per wake.
+  Log.info("=== fw v%d commit=%s | Device OS %s | wake=%lums telemetry=%lums",
+           FIRMWARE_VERSION, GIT_COMMIT_SHA, System.version().c_str(),
+           WAKE_INTERVAL_MS, TELEMETRY_INTERVAL_MS);
 
   System.on(firmware_update, firmwareUpdateHandler);
   System.on(network_status, networkStatusHandler);
@@ -777,6 +892,12 @@ void loop() {
     g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX
                                       ? UINT32_MAX
                                       : g_cloudConnectAttemptsCount + 1;
+    // Same reasoning as the teardown stamp in sleepWithCellularOff(): this
+    // is the moment the modem starts drawing, and network_status_powering_on
+    // only reaches the handler a pump later.
+    if (s_modemPhase == MODEM_OFF) {
+      modemPhaseSet(System.millis(), MODEM_SEARCH, "Particle.connect()");
+    }
     Particle.connect();
   }
 
