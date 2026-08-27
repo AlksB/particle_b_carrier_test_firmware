@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 24;
+const int FIRMWARE_VERSION = 26;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -76,7 +76,7 @@ const unsigned long MAX_OTA_WAIT_MS = 5UL * 60 * 1000; // 5 minutes
 // is delivered via the system thread with some latency - disconnecting the
 // instant our own publish call returns risks tearing the connection down
 // right as a push is starting, before the flag has had a chance to flip.
-const unsigned long POST_REPORT_LINGER_MS = 10UL * 1000; // 10 seconds
+const unsigned long POST_REPORT_LINGER_MS = 3UL * 1000; // 3 seconds
 
 static float readBatteryVoltage() {
   const pin_t VBAT_MEAS_PIN = A0;
