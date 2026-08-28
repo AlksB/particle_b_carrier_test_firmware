@@ -178,10 +178,11 @@ static float readBatteryVoltage() {
 // passes 5.72V again near 40% - so any reading in the 5.70-5.81V band is
 // ambiguous between ~95% and ~40%, and the table resolves it with the median
 // (most samples at those voltages were mid-life). That ambiguity is why this
-// function is no longer called directly for telemetry:
-// batteryPercentEstimate() below folds in the connect counter, which does
-// distinguish the two ends of the band. Below ~5.6V the curve steepens and
-// voltage alone is within a couple of percent of truth.
+// function is no longer called directly for telemetry: above 5.68V
+// batteryPercentEstimate() ignores this table entirely and counts the
+// modem's charge instead, which does distinguish the two ends of the band.
+// Below ~5.6V the curve steepens and voltage alone is within a couple of
+// percent of truth, and that is the region this table is kept for.
 //
 // The pack died within an hour of reporting 2.96V, so the 2.90V floor is the
 // real cliff edge, not a theoretical cell cutoff.
@@ -249,51 +250,93 @@ static int batteryPercentFromVoltage(float vbat) {
   return ret;
 }
 
-// Battery estimate that resolves the voltage table's blind spot with the
-// connect counter.
+// Battery estimate that resolves the voltage table's blind spot by counting
+// the charge the modem has drawn.
 //
-// In the same calibration run behind batteryPercentFromVoltage()'s table,
-// g_cloudConnectAttemptsCount ticked once per reporting cycle - 860 at the
-// last telemetry, ~868 by actual death - so on a fresh pack the counter is
-// a coulomb counter: charge consumed is attempts/PACK_CONNECT_LIFETIME.
-// That is exactly the signal voltage lacks in the 5.68-5.90V band, where a
-// fresh pack (after its initial sag) and a ~40%-discharged one read the
-// same. Inside that band the counter answers; everywhere else voltage wins:
-//   >= 5.90V - only ever seen on a fresh pack, voltage is unambiguous
-//   <  5.68V - the curve is steep and voltage tracks truth within ~1-2%,
-//              and unlike the counter it stays right if the pack's actual
-//              capacity differs from the calibration pack (other brand,
-//              cold weather) or the counter didn't start at zero
+// Voltage and coulombs are each blind where the other sees, and the split is
+// AMBIGUOUS_BAND_LOW_V:
+//   <  5.68V - the discharge curve has steepened, voltage tracks truth to
+//              within a percent or two, and it is measured rather than
+//              modelled: it stays right whatever the cells' real capacity
+//              turns out to be, and whatever the modem actually drew
+//   >= 5.68V - the Li-MnO2 plateau, where voltage says almost nothing. The
+//              pack passes 5.72V both while fresh (sagging in) and again
+//              near 40%, so a reading here is ambiguous over more than half
+//              the pack's life. Charge drawn is the only signal left
 //
-// Replayed over the calibration log this lands within 0.5% of truth on
-// average (worst 2.3%), against 9.7%/52% for the voltage table alone.
+// This replaces g_cloudConnectAttemptsCount, which was a coulomb counter
+// only by accident: it counted cycles, and the calibration pack happened to
+// deliver 868 of them. A cycle is not a fixed amount of charge. The same
+// firmware measured 45s cold-start cycles on a good cell and a 240s
+// registration stall on a bad one - a 5x spread that a cycle count reports
+// as one tick either way, while the phase timers see all of it.
 //
-// The counter reads "cycles on this pack" only because a battery swap cuts
-// power, and retained SRAM does not survive power loss on this board - the
-// calibration run itself started from attempts=1 on fresh cells. If a pack
-// is ever swapped without the counters clearing, the in-band estimate reads
-// low (stale counter), but drops out of the picture as soon as the pack
-// leaves the band; the floor below keeps it from ever claiming near-dead.
-static int batteryPercentEstimate(float vbat, uint32_t connectAttempts) {
-  // Connect cycles a pack delivers from fresh to death, from the
-  // calibration run. Re-derive if the reporting cadence or the per-cycle
-  // radio cost changes materially - it is "cycles", not hours.
-  static const float PACK_CONNECT_LIFETIME = 868.0f;
+// Each timer gets its own current, because the three are genuinely different
+// regimes and the spread between them is wide: on one PPK trace the modem
+// averaged 187mA registered against 72mA on its way down, a factor of 2.6
+// that a single constant would have to split the difference on.
+//
+// The constants are the worst figure each phase produced across four PPK
+// captures, not the typical one - "full power", as the pack should be
+// budgeted. The reason the worst and the typical differ so much is a carrier
+// re-steer that happened mid-test: the SARA-R510S moved from T-Mobile to
+// AT&T, RSRQ fell from -13.5 to -17.5dB, and Cat-M1 answered by repeating
+// transmissions until a fixed-size DTLS handshake took 4148ms instead of
+// 211ms. That is the same 1.5-2x on current, and nothing in the firmware
+// chooses it or can see it coming. So the budget assumes it is always the
+// case:
+//
+//   phase      T-Mobile      AT&T      constant
+//   search     169  139      213  159    215mA
+//   ready      187  213      364  339    365mA
+//   offgoing    72  126      218  247    250mA
+//
+// (two captures per carrier; integrated over exactly the intervals these
+// timers count, taken from the phase-transition log lines, aligned to the
+// current trace by cross-correlating the modem-active window)
+//
+// On a good cell the gauge therefore falls roughly twice as fast as the pack
+// really empties, bottoms out at the 38% floor, and hands over to voltage.
+// It reports the pack pessimistically, never optimistically.
+//
+// What this does NOT count is the sleeping board, ~0.4mA, which at the
+// 12-hour field cadence is comparable to the modem's own share. The estimate
+// is a modem-airtime budget by construction; fold in an idle term once a
+// full discharge run on the final configuration says what the baseline
+// really is with the reed open.
+//
+// The timers read "on this pack" only because a battery swap cuts power and
+// retained SRAM does not survive that. If a pack is ever swapped with the
+// counters intact the estimate reads low, but it drops out of the picture as
+// soon as the pack leaves the plateau, and the floor keeps it from ever
+// claiming near-dead on a healthy cell.
+static int batteryPercentEstimate(float vbat, uint64_t searchMs,
+                                  uint64_t readyMs, uint64_t offgoingMs) {
+  // Nominal capacity of the pack. The two CR123A cells are in series, so the
+  // pack carries one cell's capacity at twice the voltage, not two cells'.
+  static const float PACK_CAPACITY_MAH = 1500.0f;
+  // Per-phase currents, worst measured. See the table above.
+  static const float SEARCH_MA = 215.0f;
+  static const float READY_MA = 365.0f;
+  static const float OFFGOING_MA = 250.0f;
   static const float AMBIGUOUS_BAND_LOW_V = 5.68f;
-  static const float AMBIGUOUS_BAND_HIGH_V = 5.90f;
 
-  int pctV = batteryPercentFromVoltage(vbat);
-  if (vbat < AMBIGUOUS_BAND_LOW_V || vbat >= AMBIGUOUS_BAND_HIGH_V) {
-    return pctV;
+  if (vbat < AMBIGUOUS_BAND_LOW_V) {
+    return batteryPercentFromVoltage(vbat);
   }
-  float pctA = 100.0f * (1.0f - (float)connectAttempts / PACK_CONNECT_LIFETIME);
-  // Voltage this high was never observed below ~37% - a counter that claims
-  // less is stale or from a longer-lived pack, so the band floor wins.
-  if (pctA < 38.0f)
-    pctA = 38.0f;
-  if (pctA > 100.0f)
-    pctA = 100.0f;
-  return (int)(pctA + 0.5f);
+
+  float usedMah = ((float)searchMs * SEARCH_MA + (float)readyMs * READY_MA +
+                   (float)offgoingMs * OFFGOING_MA) /
+                  3600000.0f;
+  float pct = 100.0f * (1.0f - usedMah / PACK_CAPACITY_MAH);
+  // Voltage this high was never observed below ~37% on the calibration pack,
+  // so a budget that claims less has drifted - stale timers, a longer-lived
+  // pack, or a kinder carrier than the constant assumes. Voltage wins.
+  if (pct < 38.0f)
+    pct = 38.0f;
+  if (pct > 100.0f)
+    pct = 100.0f;
+  return (int)(pct + 0.5f);
 }
 
 // Prints raw AT command responses as they arrive
@@ -786,9 +829,9 @@ static void recordTelemetrySent() {
 //
 // `battery` is derived from vBatLoad rather than vBatIdle: the calibration
 // curve behind it was logged under load too, so feeding it the loaded
-// reading keeps both sides of the comparison consistent. The connect
-// counter goes in as well - see batteryPercentEstimate() for how it breaks
-// the flat top of the discharge curve.
+// reading keeps both sides of the comparison consistent. The modem timers
+// go in as well - see batteryPercentEstimate() for how they break the flat
+// top of the discharge curve.
 //
 // signalStrength/signalQuality duplicate what the cloud-requested vitals
 // (see loop()) already report. That duplication is deliberate: vitals
@@ -805,13 +848,12 @@ static void recordTelemetrySent() {
 // one that connects first time, and that shows up here long before it shows
 // up as a missed report. Both are `retained` so a reset doesn't zero them.
 //
-// The three modem*Sec fields are the same story measured in time rather
-// than in cycles - see g_modemSearchMs. Nothing consumes them yet; they go
-// out so that the next full-discharge run logs them, which is what it
-// takes to replace batteryPercentEstimate()'s per-cycle constant with a
-// real mA-h budget. They are reported apart rather than summed because
-// each is a different current regime: transmitter bursts while searching,
-// low milliamps once registered, and a detach that draws less than either.
+// The three modem*Sec fields are the same story measured in time rather than
+// in cycles, and they are what `battery` is computed from above - each
+// weighted by its own current, since the phases differ by up to 2.6x. They
+// go out individually rather than pre-weighted so that a discharge run can
+// re-fit those weights against the pack that actually died, which is the one
+// thing telemetry can't reconstruct from a single percentage.
 //
 // slotOffsetSec makes the schedule self-describing: it is this device's fixed
 // second within the reporting window (see telemetrySlotOffsetS()), so the back
@@ -819,8 +861,6 @@ static void recordTelemetrySent() {
 // against the device ID and getting it subtly wrong.
 static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
                              float signalStrength, float signalQuality) {
-  int batteryPercentage =
-      batteryPercentEstimate(vBatLoad, g_cloudConnectAttemptsCount);
   // Fold the session we're publishing from into the counters first, so the
   // numbers include this connect instead of lagging a report behind.
   // Nothing between the accrual and the reads pumps the application
@@ -830,6 +870,8 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   uint32_t modemSearchSec = (uint32_t)(g_modemSearchMs / 1000);
   uint32_t modemReadySec = (uint32_t)(g_modemReadyMs / 1000);
   uint32_t modemOffgoingSec = (uint32_t)(g_modemOffgoingMs / 1000);
+  int batteryPercentage = batteryPercentEstimate(
+      vBatLoad, g_modemSearchMs, g_modemReadyMs, g_modemOffgoingMs);
   String payload = String::format(
       "{"
       "\"reedclosed\":%d,"
