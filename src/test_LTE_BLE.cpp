@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 30;
+const int FIRMWARE_VERSION = 31;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -27,23 +27,35 @@ static SerialLogHandler logHandler(LOG_LEVEL_INFO);
 // Reed switch input. It shorts the pin to GND when closed, so the reading
 // is an active-low one against the internal pull-up.
 //
-// That pull-up (~13k typ on nRF52840, so ~VDD/13k =~ 250uA while the reed is
-// closed) now stays enabled continuously instead of being switched on around
-// each sample. The pin doubles as a sleep wake source - see
-// sleepWithCellularOff() - and the nRF52840's GPIO SENSE/DETECT logic needs a
-// defined level on the pin for the whole sleep window to fire at all, which
-// is the entire time between polls. Toggling the pull-up around the sample
-// would therefore save nothing and just break the wake, so the ~250uA is the
-// standing price of reporting transitions the moment they happen rather than
-// up to WAKE_INTERVAL_MS later.
+// That pull-up is ~13k typ on nRF52840, so ~VDD/13k =~ 250uA for as long as it
+// is enabled with the reed closed - on a 1500mAh pack that is 6mAh a day, more
+// than a quarter of the whole budget, and it would be spent continuously
+// whether or not anything ever happens. So it is switched on only around the
+// sample and left off in between: a millisecond per poll instead of the full
+// minute, which takes the same current down to a few microamps averaged.
+//
+// The cost of that is the pin can no longer be a sleep wake source. The
+// nRF52840's GPIO SENSE/DETECT logic needs a defined level on the pin for the
+// whole sleep window to fire at all, and with no pull the line floats between
+// polls. A transition is therefore reported at the next wake rather than the
+// moment it happens - up to WAKE_INTERVAL_MS late - and a pulse shorter than
+// that which returns to its original state is not seen at all. For a switch
+// whose trip brings someone out to the device, a minute of latency is not
+// worth a quarter of the pack.
 static const pin_t REED_PIN = D6;
 
-static bool readReedIsClosed() { return !digitalRead(REED_PIN); }
+static bool readReedIsClosed() {
+  pinMode(REED_PIN, INPUT_PULLUP);
+  delayMicroseconds(1000); // let the line settle before sampling
+  bool closed = !digitalRead(REED_PIN);
+  pinMode(REED_PIN, INPUT); // no pull - stop burning current until next poll
+  return closed;
+}
 
-// Upper bound on how long we stay asleep with nothing to do. A reed
-// transition wakes us immediately (see sleepWithCellularOff()), so this is
-// only the fallback cadence: it re-polls the switch in case an edge was ever
-// missed, and it's what paces the telemetry check below.
+// How long we stay asleep with nothing to do. This is the reed switch's whole
+// sampling cadence - the pin is not a wake source (see REED_PIN), so a
+// transition is picked up by the poll at the top of the next wake - and it is
+// also what paces the telemetry check below.
 const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
 
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
@@ -720,6 +732,14 @@ static unsigned long g_telemetryBudgetWindowMs = 0;
 
 // This device's fixed position inside the reporting window, in seconds.
 //
+// Currently short-circuited to 0 on purpose, for testing: every device then
+// lands on the same slot boundary, so a bench device's next report is at a
+// time you can predict without reading its Device ID out first, and two
+// devices side by side report together. Restore the hash below before any
+// fleet rollout - with the offset pinned at 0 the whole point of the grid is
+// gone and every device reaches for a cell at exactly 00/06/12/18 UTC, which
+// is the pile-up TELEMETRY_PERIOD_S exists to spread out.
+//
 // FNV-1a over the Device ID: no provisioning step and no coordination with the
 // cloud, yet the fleet spreads evenly across the window and each device keeps
 // the same second for life. That stability is the point - it is what makes
@@ -730,6 +750,7 @@ static unsigned long g_telemetryBudgetWindowMs = 0;
 // Cached because System.deviceID() builds a String on every call and this is
 // consulted on every wake.
 static uint32_t telemetrySlotOffsetS() {
+  return 0;                            // 0 for testing purposes
   static uint32_t cached = UINT32_MAX; // never a real offset - see the modulo
   if (cached == UINT32_MAX) {
     String id = System.deviceID();
@@ -921,8 +942,8 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   return waitForPublish(result, "telemetry", payload.c_str());
 }
 
-// Fired immediately (independent of the telemetry cadence) whenever the reed
-// switch flips state between wakes. `changedAt` is captured at poll time
+// Fired as soon as the flip is seen, independent of the telemetry cadence,
+// whenever the reed switch has changed state since the last wake. `changedAt` is captured at poll time
 // (see enqueueReedTransition()), not at publish time, and rendered via
 // Time.timeStr() instead of a raw unix timestamp. Retries a few times in
 // place (while we're still connected anyway) - this event is the one thing
@@ -1092,17 +1113,12 @@ static void sleepWithCellularOff() {
     modemPhaseSet(System.millis(), MODEM_OFF, "clamped at sleep");
   }
   SystemSleepConfiguration sleepConfig;
-  // Wake on either reed edge as well as on the timer, so a transition is
-  // reported the moment it happens instead of waiting out the rest of the
-  // sleep window. CHANGE covers both directions - open and close are equally
-  // worth reporting - and the pin keeps its INPUT_PULLUP from setup() right
-  // through sleep, which is what makes the nRF52840's DETECT logic able to
-  // see the edge at all (see REED_PIN). The duration stays as the fallback:
-  // it re-polls the switch in case an edge was ever missed and it's what
-  // paces telemetry.
+  // Timer only. The reed pin is deliberately not a wake source: that would
+  // need its pull-up held on across the whole sleep window, which is the one
+  // standing current on this board worth caring about (see REED_PIN). The
+  // switch is sampled by the poll at the top of each wake instead.
   sleepConfig.mode(SystemSleepMode::ULTRA_LOW_POWER)
-      .duration(WAKE_INTERVAL_MS)
-      .gpio(REED_PIN, CHANGE);
+      .duration(WAKE_INTERVAL_MS);
   // Brackets the microamp window for an external current trace: this is the
   // last thing on the wire before the drop, and "Woke from sleep" below is
   // the first thing after it. The short delay is what makes that true - the
@@ -1116,8 +1132,8 @@ static void sleepWithCellularOff() {
   if (result.error() != SYSTEM_ERROR_NONE) {
     // Sleep didn't actually happen (e.g. unexpectedly unsupported config) -
     // fall back to a plain wait instead of spinning the loop with no pacing.
-    // Poll the reed while waiting and cut the wait short on a transition, so
-    // this path reports just as promptly as the GPIO wake above would have.
+    // Poll the reed while waiting and cut the wait short on a transition,
+    // so this path is no slower to notice one than the timed sleep above.
     bool reedAtWaitStart = readReedIsClosed();
     unsigned long waitStart = millis();
     while (millis() - waitStart < WAKE_INTERVAL_MS &&
@@ -1180,9 +1196,9 @@ void setup() {
   System.on(firmware_update, firmwareUpdateHandler);
   System.on(network_status, networkStatusHandler);
 
-  // Enabled once and left on for good - the sleep wake source needs it (see
-  // REED_PIN).
-  pinMode(REED_PIN, INPUT_PULLUP);
+  // No pull between polls - readReedIsClosed() enables it around each sample
+  // and takes it back off (see REED_PIN).
+  pinMode(REED_PIN, INPUT);
 
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
