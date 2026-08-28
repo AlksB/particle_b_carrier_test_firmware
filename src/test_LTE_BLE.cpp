@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 28;
+const int FIRMWARE_VERSION = 29;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -44,7 +44,7 @@ static bool readReedIsClosed() { return !digitalRead(REED_PIN); }
 // transition wakes us immediately (see sleepWithCellularOff()), so this is
 // only the fallback cadence: it re-polls the switch in case an edge was ever
 // missed, and it's what paces the telemetry check below.
-const unsigned long WAKE_INTERVAL_MS = 10 * 1000;
+const unsigned long WAKE_INTERVAL_MS = 60 * 1000;
 
 // Full telemetry (reed/cellular/battery) is cheaper to send less often than
 // we poll the reed switch. It goes out on a fleet-wide slot grid rather than
