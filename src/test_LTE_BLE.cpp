@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 29;
+const int FIRMWARE_VERSION = 30;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -706,6 +706,18 @@ static bool g_bootTelemetryPending = true;
 // retained: after a reset the boot report above re-establishes it anyway.
 static unsigned long g_lastTelemetryMillis = 0;
 
+// Start of the attempt window the counter above belongs to while the clock has
+// never been synced (see telemetryBudgetRollover()). With no grid to pin the
+// budget to, the window is the same period measured from the last hand-back.
+//
+// Deliberately not retained, unlike the slot bookkeeping: millis() restarts at
+// zero on a reset, so a retained millis timestamp would read as an enormous
+// elapsed time and hand out a fresh budget on every reset - exactly what
+// retaining the counter is meant to prevent. A reset therefore restarts this
+// window rather than resuming it, which is the same latitude the clocked path
+// already gives a reset landing inside a slot.
+static unsigned long g_telemetryBudgetWindowMs = 0;
+
 // This device's fixed position inside the reporting window, in seconds.
 //
 // FNV-1a over the Device ID: no provisioning step and no coordination with the
@@ -773,23 +785,37 @@ static bool telemetryOwed() {
 // Whether telemetry still has attempts left to spend on powering the modem up
 // for its own sake.
 //
-// While the clock is unsynced the budget doesn't apply: there is no next slot
-// to defer to, and a report is the very thing that would get us a clock. That
-// only ever matters on a device that has never once reached the cloud.
+// The budget applies whether or not the clock has been synced. It used to be
+// waived while unsynced, on the grounds that there is no next slot to defer to
+// and a report is the very thing that would get us a clock - but with nothing
+// capping it, a device that cannot register spends 12 of every 27 minutes with
+// the modem searching, which empties a fresh pack in about sixteen hours and
+// sends nothing at all in the meantime. The unsynced case gets its own window
+// instead (see telemetryBudgetRollover()), so such a device keeps trying
+// indefinitely at the same rate a synced one would.
 //
 // The boot report draws on the same budget rather than getting its own. If it
 // burns all three it isn't dropped - g_bootTelemetryPending stays set, so it
-// goes out at the next slot, where telemetryBudgetRollover() has handed the
+// goes out in the next window, where telemetryBudgetRollover() has handed the
 // attempts back. It just stops keeping the modem busy in the meantime.
 static bool telemetryWithinBudget() {
-  return !Time.isValid() || g_telemetryAttempts < TELEMETRY_MAX_ATTEMPTS;
+  return g_telemetryAttempts < TELEMETRY_MAX_ATTEMPTS;
 }
 
 // Hands the attempt budget back when we roll into a new slot, so a slot that
 // was given up on doesn't leave the next one with nothing left to spend.
+//
+// With no clock there is no grid, so the window is just TELEMETRY_INTERVAL_MS
+// measured from the last hand-back - the same fallback cadence telemetryOwed()
+// uses. The first window runs from boot, which is what gives the boot report
+// its three attempts.
 static void telemetryBudgetRollover() {
   if (!Time.isValid()) {
-    return; // no grid yet - telemetryWithinBudget() ignores the counter anyway
+    if (millis() - g_telemetryBudgetWindowMs >= TELEMETRY_INTERVAL_MS) {
+      g_telemetryBudgetWindowMs = millis();
+      g_telemetryAttempts = 0;
+    }
+    return;
   }
   time_t slot = currentTelemetrySlot(Time.now());
   if (slot != g_telemetrySlotAttempted) {
@@ -964,7 +990,14 @@ static void enqueueReedTransition(bool state, time_t timestamp) {
 // Attempts to deliver every queued transition, oldest first, stopping (and
 // preserving order) at the first one that fails so it's retried - in
 // order - on a later wake instead of letting later entries jump ahead.
-static void drainReedQueue() {
+//
+// Returns whether the queue is now empty. A false return means the entry at
+// the head has just used up its three in-place attempts, and the caller must
+// not call this again on the same connection - see reedDrainBlocked in
+// loop(). Anything queued after that entry is behind it in the FIFO and
+// cannot be delivered before it anyway, so nothing is held back by waiting
+// for the next session.
+static bool drainReedQueue() {
   while (g_reedQueueCount > 0) {
     ReedTransition &t = g_reedQueue[g_reedQueueHead];
     time_t ts =
@@ -978,6 +1011,7 @@ static void drainReedQueue() {
     g_reedQueueHead = (g_reedQueueHead + 1) % REED_QUEUE_CAPACITY;
     g_reedQueueCount--;
   }
+  return g_reedQueueCount == 0;
 }
 
 // Whether anything is still waiting to go out that we are willing to power the
@@ -1194,16 +1228,29 @@ void loop() {
   // connected for a bit (see POST_REPORT_LINGER_MS) instead of disconnecting
   // the instant our own publish call returns.
   static unsigned long reportDoneAt = 0;
+  // Both of these exist because the connected block below is re-entered on
+  // every loop() pass for as long as this session stays up - the OTA hold and
+  // the post-report linger each return straight back into it. Without them a
+  // publish that isn't acknowledged is simply retried on the next pass, which
+  // turns "three in-place attempts" into three per pass and, while an OTA
+  // transfer holds the connection open for up to MAX_OTA_WAIT_MS, into dozens
+  // of duplicate events for one telemetry slot.
+  //
+  // Set when the head of the reed queue has spent its in-place attempts on
+  // this connection. Retrying it costs the same three failed publishes every
+  // pass and cannot succeed for a different reason than it just didn't; the
+  // outer loop's RETRY_INTERVAL_MS pacing owns the next try.
+  static bool reedDrainBlocked = false;
+  // Set once telemetry has had its attempt on this connection. The slot's
+  // budget is spent per session (counted where the session opens, below), so
+  // publishing twice here would charge one attempt for two events.
+  static bool telemetryTriedThisSession = false;
   // lastReedState here only tracks "what we last saw at poll time", for
   // edge detection - it does NOT track delivery. Delivery is tracked
   // independently by the ReedTransition queue above, so a transition that
   // fails to publish and then reverts before the next wake isn't silently
   // lost (see enqueueReedTransition()/drainReedQueue()).
   static bool lastReedState = readReedIsClosed();
-  // Force one reed_changed report on first boot, even though the initial
-  // reading trivially matches itself (see lastReedState above) - otherwise
-  // the very first known reed state would never get queued.
-  static bool firstPollThisBoot = true;
   static float vBatIdle = 0.;
   bool reedState = readReedIsClosed();
   // Relight the LED with the fresh reading every pass - covers both waking
@@ -1214,8 +1261,21 @@ void loop() {
   // and queue them immediately - this must happen regardless of whether
   // this wake ends up connecting, so a flip that happens while we're mid-
   // session (still connecting, or draining the queue) is captured too.
-  if (firstPollThisBoot || reedState != lastReedState) {
-    firstPollThisBoot = false;
+  //
+  // Only actual transitions. The state at boot is not one: lastReedState is
+  // seeded from the pin on the first pass, so the first poll trivially matches
+  // itself and queues nothing. It is reported by the boot telemetry report
+  // instead, whose payload leads with reedclosed - the same information, on
+  // the path that has an attempt budget.
+  //
+  // That distinction is the whole point. A queued transition is worth an
+  // unlimited run of connect attempts because a reed trip is what brings
+  // someone out to the device, batteries included; a synthesised "here is my
+  // state at power-up" entry is not, and it is queued at exactly the moment a
+  // fresh pack has just gone in. Before this it inherited the same unlimited
+  // retries and could empty that pack in about sixteen hours reporting that
+  // nothing had happened.
+  if (reedState != lastReedState) {
     lastReedState = reedState;
     enqueueReedTransition(reedState, Time.isValid() ? Time.now() : 0);
   }
@@ -1251,6 +1311,8 @@ void loop() {
     checkedOperatorMode = false;
     otaWaitStart = 0;
     reportDoneAt = 0;
+    reedDrainBlocked = false;
+    telemetryTriedThisSession = false;
     vBatIdle = readBatteryVoltage();
     // Spend one of the slot's attempts if telemetry is part of why we're
     // connecting. The budget check is what keeps a session opened purely for
@@ -1296,14 +1358,23 @@ void loop() {
     }
     // Deliver every queued reed transition, oldest first - stops (and
     // preserves order) at the first failure, retried next wake.
-    drainReedQueue();
+    //
+    // Still called on every pass rather than once per session: a transition
+    // that lands while we are lingering (or holding the connection open for
+    // an OTA) is published straight away on the connection we already have,
+    // which is the whole point of the reed path. Only a head entry that has
+    // already failed here stops it - see reedDrainBlocked.
+    if (!reedDrainBlocked && !drainReedQueue()) {
+      reedDrainBlocked = true;
+    }
 
     // telemetryOwed() rather than the budget-aware reportPending(): while
     // we're connected the report is free, so a slot that has already spent
     // its three attempts still gets sent if a reed transition happened to
     // open a session. What the budget governs is powering the modem up for
     // telemetry alone, not what we do once it is up.
-    if (telemetryOwed()) {
+    if (telemetryOwed() && !telemetryTriedThisSession) {
+      telemetryTriedThisSession = true;
       // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
       // same as the plain-delay TESTING_MODE path), so setup() never re-runs
       // to give us a fresh reading - refresh it right before each send.
