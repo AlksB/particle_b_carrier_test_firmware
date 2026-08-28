@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 27;
+const int FIRMWARE_VERSION = 28;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -510,6 +510,74 @@ static int copsModeCallback(int type, const char *buf, int len, int *mode) {
     }
   }
   return WAIT;
+}
+
+// Names for the access technologies this board can actually report, so a
+// serial capture does not need net_hal.h open beside it.
+static const char *accessTechName(int rat) {
+  switch (rat) {
+  case NET_ACCESS_TECHNOLOGY_GSM:
+    return "GSM";
+  case NET_ACCESS_TECHNOLOGY_EDGE:
+    return "EDGE";
+  case NET_ACCESS_TECHNOLOGY_UMTS:
+    return "UMTS";
+  case NET_ACCESS_TECHNOLOGY_LTE:
+    return "LTE";
+  case NET_ACCESS_TECHNOLOGY_LTE_CAT_M1:
+    return "LTE-M";
+  case NET_ACCESS_TECHNOLOGY_LTE_CAT_NB1:
+    return "NB-IoT";
+  default:
+    return "unknown";
+  }
+}
+
+// Everything Device OS knows about the radio, in one line per report.
+//
+// This exists because a session where every active phase drew 1.5-2x more
+// current than the one before it took an hour to explain, and the answer -
+// the SIM had re-steered to another carrier whose cell was ~3.5dB worse on
+// RSRQ - was invisible in the log. Signal *strength* was unchanged, because
+// that is derived from RSRP and RSRP barely moved; what moved was quality,
+// and with it the number of Cat-M1 repetitions per transmission. A
+// fixed-size DTLS handshake went from 211ms to 4148ms on the same payload.
+// So RSRQ in dB is the number to watch, and it was never being written down.
+//
+// Two Device OS calls, no AT of our own:
+//   Cellular.RSSI()            - RAT, RSRP in dBm, RSRQ in dB, and the two
+//                                percentages that also reach the cloud
+//   cellular_global_identity() - which tower: MCC, MNC, LAC, cell id
+//
+// What Device OS does not carry, and this therefore cannot log: EARFCN,
+// band, channel bandwidth, physical cell id and SINR. cellular_signal_t
+// (hal/inc/cellular_hal_constants.h) has fields for RAT, RSRP, RSRQ and the
+// percentages, and nothing else - those values only exist inside the modem's
+// AT+UCGED reply. Of them only SINR would really be missed, and RSRQ tracks
+// it closely enough to tell a good cell from a bad one: across the two
+// carriers seen here, RSRQ -13.5dB went with SINR +0.5dB and RSRQ -17.5dB
+// with SINR -4dB.
+static void logCellularDetails() {
+  CellularSignal sig = Cellular.RSSI();
+
+  CellularGlobalIdentity cgi = {};
+  cgi.size = sizeof(cgi);
+  cgi.version = CGI_VERSION_LATEST;
+  if (cellular_global_identity(&cgi, nullptr) == SYSTEM_ERROR_NONE) {
+    Log.info("cell mcc=%u mnc=%u lac=0x%04x cid=0x%08lx",
+             cgi.mobile_country_code, cgi.mobile_network_code,
+             cgi.location_area_code, (unsigned long)cgi.cell_id);
+  } else {
+    Log.info("cell identity unavailable");
+  }
+
+  // getStrengthValue()/getQualityValue() are RSRP in dBm and RSRQ in dB on
+  // LTE; the percentages beside them are what the console shows. Both come
+  // back negative-or-zero when the modem has nothing to report.
+  Log.info("signal rat=%s rsrp=%.0f dBm (%.0f%%) rsrq=%.1f dB (%.0f%%)",
+           accessTechName((int)sig.getAccessTechnology()),
+           sig.getStrengthValue(), sig.getStrength(), sig.getQualityValue(),
+           sig.getQuality());
 }
 
 // Migration cleanup for devices that ran a build which pinned the modem to
@@ -1149,8 +1217,8 @@ void loop() {
     // pay for them.
     if (telemetryOwed() && g_telemetryAttempts < TELEMETRY_MAX_ATTEMPTS) {
       g_telemetryAttempts++;
-      Log.info("Telemetry attempt %d/%d for this slot", (int)g_telemetryAttempts,
-               TELEMETRY_MAX_ATTEMPTS);
+      Log.info("Telemetry attempt %d/%d for this slot",
+               (int)g_telemetryAttempts, TELEMETRY_MAX_ATTEMPTS);
     }
     g_cloudConnectAttemptsCount = g_cloudConnectAttemptsCount >= UINT32_MAX
                                       ? UINT32_MAX
@@ -1198,6 +1266,10 @@ void loop() {
       // same as the plain-delay TESTING_MODE path), so setup() never re-runs
       // to give us a fresh reading - refresh it right before each send.
       float vBatLoad = readBatteryVoltage();
+      // Logged rather than published: the cloud already gets the operator and
+      // the cell identity in vitals, and this is the level of detail you only
+      // want when you are looking at a serial capture next to a current trace.
+      logCellularDetails();
       CellularSignal sig = Cellular.RSSI();
       if (publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(),
                            sig.getQuality())) {
