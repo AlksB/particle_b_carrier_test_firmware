@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 31;
+const int FIRMWARE_VERSION = 32;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -567,6 +567,128 @@ static int copsModeCallback(int type, const char *buf, int len, int *mode) {
   return WAIT;
 }
 
+// The AT+UCGED mode 2 serving-cell line, which is where every radio figure
+// the cloud never sees actually lives.
+//
+// Device OS already asks the modem for this exact line - see
+// SaraNcpClient::getSignalQuality(), the PLATFORM_NCP_SARA_R510 branch in
+// sara_ncp_client.cpp - and then throws all but two of its fields away:
+//
+//   resp.scanf("%*d,%*d,%*d,%*d,%*x,%*x,%*d,%*x,%*x,%*x,%u,%d,%*[^\n]", ...)
+//
+// Ten fields skipped, RSRP and RSRQ kept, and "%*[^\n]" swallows the
+// remaining eleven. Those two are what becomes `signal` in vitals, so
+// everything else on the line has never once left the modem.
+//
+// The field types below are not guesswork for the first twelve: they are
+// what that format string itself asserts - four decimals, two hex, one
+// decimal, three hex, then RSRP unsigned and RSRQ signed. Fields 13 onward
+// come from the u-blox SARA-R5 AT manual, and are the reason `raw` is
+// published beside the parsed values: one capture off a real device confirms
+// the mapping without spending another OTA on it, and if the manual and the
+// module disagree the raw line still holds the answer.
+//
+// Whatever UCGED mode the modem is in is left alone. Device OS issues
+// AT+UCGED=5 for the R410 only (sara_ncp_client.cpp:2729) and never sets a
+// mode on the R510 - and vitals reporting real dBm is itself the proof that
+// mode 2 is already active, because the parser above could not otherwise
+// have matched. Setting it here would be a write with no cheap way back.
+struct UcgedServingCell {
+  bool valid;
+  unsigned earfcn;
+  unsigned band;
+  unsigned ulBandwidth;
+  unsigned dlBandwidth;
+  unsigned tac;
+  unsigned long cellId;
+  unsigned physicalCellId;
+  unsigned rsrpIndex;
+  int rsrqIndex;
+  int sinr;
+  int rrcState;
+  int rankIndicator;
+  int cqi;
+  int avgRsrpIndex;
+  int puschPower;
+  int pucchPower;
+  // A real 23-field row measures a little under 100 characters; this is
+  // sized so the line is never truncated, because a truncated tail would
+  // silently drop the very fields the raw copy exists to let us verify.
+  char raw[160];
+};
+
+// Cellular.command() hands over one reply line at a time, and only the
+// serving-cell row is wanted. No prefix to match on here - unlike "+COPS:"
+// the row is bare CSV - so the field count does the filtering: "+UCGED: 2"
+// matches nothing at all, and the <rat>,<svc>,<MCC>,<MNC> row above it runs
+// out of fields at four, while a serving-cell row always reaches RSRQ.
+//
+// First line wins. The modem sends one serving-cell row per reply, and
+// bailing out once we have it keeps a stray URC sharing the response from
+// overwriting a good parse.
+static int ucgedCallback(int type, const char *buf, int len,
+                         UcgedServingCell *cell) {
+  if (!buf || !cell || cell->valid) {
+    return WAIT;
+  }
+  // Copied out before anything reads it: Cellular.command() passes a length,
+  // not a NUL-terminated string, and every parse below needs a terminator.
+  char line[sizeof(cell->raw)];
+  size_t n = (size_t)len < sizeof(line) - 1 ? (size_t)len : sizeof(line) - 1;
+  memcpy(line, buf, n);
+  line[n] = '\0';
+
+  // Strip the CRLF the modem wraps every line in, so `raw` stays valid
+  // inside a JSON string literal rather than breaking the payload in two.
+  char *start = line;
+  while (*start == '\r' || *start == '\n' || *start == ' ') {
+    start++;
+  }
+  char *end = start + strlen(start);
+  while (end > start &&
+         (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) {
+    end--;
+  }
+  *end = '\0';
+
+  // Anything past RSRQ is optional - left at -1 so a short line publishes as
+  // "not reported" instead of as a plausible-looking zero.
+  unsigned earfcn = 0, band = 0, ulBw = 0, dlBw = 0, tac = 0, pci = 0,
+           rsrp = 0;
+  unsigned long cellId = 0;
+  int rsrq = 0, sinr = -1, rrc = -1, ri = -1, cqi = -1, avgRsrp = -1,
+      pusch = -1, pucch = -1;
+  int matched = sscanf(
+      start, "%u,%u,%u,%u,%x,%lx,%u,%*x,%*x,%*x,%u,%d,%d,%d,%d,%d,%d,%d,%d",
+      &earfcn, &band, &ulBw, &dlBw, &tac, &cellId, &pci, &rsrp, &rsrq, &sinr,
+      &rrc, &ri, &cqi, &avgRsrp, &pusch, &pucch);
+  // Nine assignments reaches RSRQ, the point at which the row is
+  // unambiguously the serving cell and not the shorter one above it.
+  if (matched < 9) {
+    return WAIT;
+  }
+
+  cell->earfcn = earfcn;
+  cell->band = band;
+  cell->ulBandwidth = ulBw;
+  cell->dlBandwidth = dlBw;
+  cell->tac = tac;
+  cell->cellId = cellId;
+  cell->physicalCellId = pci;
+  cell->rsrpIndex = rsrp;
+  cell->rsrqIndex = rsrq;
+  cell->sinr = sinr;
+  cell->rrcState = rrc;
+  cell->rankIndicator = ri;
+  cell->cqi = cqi;
+  cell->avgRsrpIndex = avgRsrp;
+  cell->puschPower = pusch;
+  cell->pucchPower = pucch;
+  snprintf(cell->raw, sizeof(cell->raw), "%s", start);
+  cell->valid = true;
+  return WAIT;
+}
+
 // Names for the access technologies this board can actually report, so a
 // serial capture does not need net_hal.h open beside it.
 static const char *accessTechName(int rat) {
@@ -599,20 +721,26 @@ static const char *accessTechName(int rat) {
 // fixed-size DTLS handshake went from 211ms to 4148ms on the same payload.
 // So RSRQ in dB is the number to watch, and it was never being written down.
 //
-// Two Device OS calls, no AT of our own:
+// Two Device OS calls, no Cellular.command() of our own:
 //   Cellular.RSSI()            - RAT, RSRP in dBm, RSRQ in dB, and the two
 //                                percentages that also reach the cloud
 //   cellular_global_identity() - which tower: MCC, MNC, LAC, cell id
 //
-// What Device OS does not carry, and this therefore cannot log: EARFCN,
-// band, channel bandwidth, physical cell id and SINR. cellular_signal_t
-// (hal/inc/cellular_hal_constants.h) has fields for RAT, RSRP, RSRQ and the
-// percentages, and nothing else - those values only exist inside the modem's
-// AT+UCGED reply. Of them only SINR would really be missed, and RSRQ tracks
-// it closely enough to tell a good cell from a bad one: across the two
-// carriers seen here, RSRQ -13.5dB went with SINR +0.5dB and RSRQ -17.5dB
-// with SINR -4dB.
-static void logCellularDetails() {
+// The reading is returned rather than dropped because Cellular.RSSI() is not
+// free: it lands in SaraNcpClient::getSignalQuality(), which issues
+// AT+COPS=3,2 and AT+COPS? by way of queryAndParseAtCops()
+// (sara_ncp_client.cpp:668) before it gets to AT+UCGED? - three AT commands
+// per call. The caller needs the same numbers for the telemetry report, and
+// asking twice bought nothing but a second snapshot taken a moment later,
+// so the log line and the published values could disagree for no reason.
+//
+// What Device OS does not carry: EARFCN, band, channel bandwidth, physical
+// cell id and SINR. cellular_signal_t (hal/inc/cellular_hal_constants.h) has
+// fields for RAT, RSRP, RSRQ and the percentages, and nothing else - those
+// values only exist inside the modem's AT+UCGED reply, and getSignalQuality()
+// discards them as it parses. publishRfSurvey() therefore asks the modem
+// again itself; there is no way to reach them through Device OS.
+static CellularSignal logCellularDetails() {
   CellularSignal sig = Cellular.RSSI();
 
   CellularGlobalIdentity cgi = {};
@@ -633,6 +761,7 @@ static void logCellularDetails() {
            accessTechName((int)sig.getAccessTechnology()),
            sig.getStrengthValue(), sig.getStrength(), sig.getQualityValue(),
            sig.getQuality());
+  return sig;
 }
 
 // Migration cleanup for devices that ran a build which pinned the modem to
@@ -940,6 +1069,97 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   particle::Future<bool> result =
       Particle.publish("telemetry", payload, PRIVATE);
   return waitForPublish(result, "telemetry", payload.c_str());
+}
+
+// The radio detail that vitals has never carried, published once per
+// telemetry session.
+//
+// Its own event rather than more fields on `telemetry`: this is test-build
+// instrumentation for an antenna comparison, so keeping it separate leaves
+// the telemetry schema - and whatever the back end already does with it -
+// untouched on the day it is dropped again. Cadence comes for free from the
+// caller, so lowering TELEMETRY_PERIOD_S on a test build samples this too.
+//
+// Half of these fields are not the measurement, they are what makes the
+// measurement mean anything. RSRP compared between two devices says nothing
+// unless both are camped on the same cell on the same band: antenna gain
+// varies enormously across the mask this project pins (bands 2/4/5/12/13,
+// see env.json), and 700MHz against 1900MHz is not a comparison. earfcn,
+// band, pci and cellId are what let a reading be thrown out. sinr, cqi and
+// the two Tx power figures are the measurement itself - the last of those
+// being the one that says whether a poor antenna is also costing battery,
+// since a modem that has to shout pays for it out of the same pack.
+//
+// RSRP and RSRQ go out as the modem's raw 3GPP index values rather than dBm,
+// on purpose: it is what the line carries, it survives with no rounding, and
+// vitals already publishes the dBm beside it. To convert (3GPP 36.133):
+// RSRP dBm = index - 141, RSRQ dB = index / 2 - 20. RSSI is not published
+// because it is not measured - on LTE AT+CESQ reports 255 for <rxlev>, that
+// field being GSM's - but it follows from what is here: for Cat-M1's 6 PRBs,
+// RSSI = RSRP - RSRQ + 10*log10(6).
+//
+// A failure here is deliberately quiet and non-fatal. The telemetry report
+// is the one that matters and has already gone out by this point; a missing
+// survey sample costs nothing but one row.
+static bool publishRfSurvey() {
+  // static rather than a local: 180-odd bytes is a lot to put on the
+  // application stack for one call, and nothing here is re-entrant.
+  static UcgedServingCell cell;
+  memset(&cell, 0, sizeof(cell));
+  // A ceiling, not a delay, and it is normally nowhere near reached:
+  // cellular_command() (cellular_hal.cpp:426) reads lines until the final
+  // result code and then returns, and the WAIT this callback keeps returning
+  // only means "next line please" - it extends nothing. UCGED reports what
+  // the modem already knows about the cell it is camped on, with no network
+  // transaction of any kind, so the reply is a UART round-trip.
+  //
+  // So the number only decides how a modem that has stopped answering is
+  // handled, and there it is deliberately generous. Device OS gives its own
+  // AT+UCGED? the 90s parser default (sara_ncp_client.cpp:851; the
+  // AtParserConfig at :239 never sets commandTimeout, so
+  // DEFAULT_COMMAND_TIMEOUT stands), and a bound that is too tight does not
+  // fail loudly - it drops samples exactly when the channel is busiest,
+  // which is a bias in the data this event exists to collect. 10s matches
+  // the AT+COPS? read above and costs nothing in the normal case.
+  Cellular.command(ucgedCallback, &cell, 10000, "AT+UCGED?\r\n");
+  if (!cell.valid) {
+    Log.warn("AT+UCGED gave no serving-cell line - no rf_survey this session");
+    return false;
+  }
+
+  Log.info("rf earfcn=%u band=%u pci=%u cell=0x%08lx sinr=%d cqi=%d "
+           "pusch=%d pucch=%d",
+           cell.earfcn, cell.band, cell.physicalCellId,
+           (unsigned long)cell.cellId, cell.sinr, cell.cqi, cell.puschPower,
+           cell.pucchPower);
+
+  String payload = String::format(
+      "{"
+      "\"earfcn\":%u,"
+      "\"band\":%u,"
+      "\"ulBw\":%u,"
+      "\"dlBw\":%u,"
+      "\"tac\":\"%04X\","
+      "\"cellId\":\"%08lX\","
+      "\"pci\":%u,"
+      "\"rsrpIdx\":%u,"
+      "\"rsrqIdx\":%d,"
+      "\"sinr\":%d,"
+      "\"rrc\":%d,"
+      "\"ri\":%d,"
+      "\"cqi\":%d,"
+      "\"avgRsrpIdx\":%d,"
+      "\"puschPwr\":%d,"
+      "\"pucchPwr\":%d,"
+      "\"ucgedRaw\":\"%s\""
+      "}",
+      cell.earfcn, cell.band, cell.ulBandwidth, cell.dlBandwidth, cell.tac,
+      (unsigned long)cell.cellId, cell.physicalCellId, cell.rsrpIndex,
+      cell.rsrqIndex, cell.sinr, cell.rrcState, cell.rankIndicator, cell.cqi,
+      cell.avgRsrpIndex, cell.puschPower, cell.pucchPower, cell.raw);
+  particle::Future<bool> result =
+      Particle.publish("rf_survey", payload, PRIVATE);
+  return waitForPublish(result, "rf_survey", payload.c_str());
 }
 
 // Fired as soon as the flip is seen, independent of the telemetry cadence,
@@ -1398,12 +1618,17 @@ void loop() {
       // Logged rather than published: the cloud already gets the operator and
       // the cell identity in vitals, and this is the level of detail you only
       // want when you are looking at a serial capture next to a current trace.
-      logCellularDetails();
-      CellularSignal sig = Cellular.RSSI();
+      CellularSignal sig = logCellularDetails();
       if (publishTelemetry(reedState, vBatLoad, vBatIdle, sig.getStrength(),
                            sig.getQuality())) {
         recordTelemetrySent();
       }
+      // After the telemetry report, never before it: telemetry is the one
+      // that has a slot budget riding on it, so it gets the first publish
+      // of the session while the connection is known good. The survey's
+      // return value is ignored on purpose - it changes nothing about
+      // whether this slot counts as reported.
+      publishRfSurvey();
       // A publish the cloud never acknowledged leaves the slot unreported on
       // purpose. This attempt is already spent (counted when the session
       // opened), so the next one comes in RETRY_INTERVAL_MS, or - once the
