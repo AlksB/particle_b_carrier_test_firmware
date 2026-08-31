@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 32;
+const int FIRMWARE_VERSION = 33;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -1604,12 +1604,35 @@ void loop() {
       reedDrainBlocked = true;
     }
 
-    // telemetryOwed() rather than the budget-aware reportPending(): while
-    // we're connected the report is free, so a slot that has already spent
-    // its three attempts still gets sent if a reed transition happened to
-    // open a session. What the budget governs is powering the modem up for
-    // telemetry alone, not what we do once it is up.
-    if (telemetryOwed() && !telemetryTriedThisSession) {
+    // Unconditional once we are connected - no telemetryOwed() and no budget
+    // check. Everything expensive about a report is the connection under it:
+    // getting there costs minutes of modem airtime, while the report itself
+    // is one publish on a link that is already up and about to be torn down
+    // regardless. So every session that reaches the cloud sends one, whatever
+    // opened it.
+    //
+    // A reed session is the case that motivated this, and it is exactly the
+    // one where the sample is worth most: someone has just been at the
+    // device, and that is when its battery, its serving cell and its antenna
+    // reading are worth having. Under the old gate a transition landing in a
+    // slot that had already reported published reed_changed and nothing else.
+    //
+    // What the budget still governs is untouched: g_telemetryAttempts is only
+    // spent where the session was opened for telemetry's own sake (see the
+    // Particle.connect() path above), and reportPending() still refuses to
+    // power the modem up for a report that isn't owed. Telemetry rides along
+    // on a reed session for free, as before - it just always rides now.
+    //
+    // recordTelemetrySent() marking the current slot on such a session is
+    // deliberate, not a side effect: a report has landed with fresher data
+    // than the scheduled one would have carried, so the scheduled one is
+    // redundant and the next is due at the next slot.
+    //
+    // telemetryTriedThisSession still holds. The connected block is
+    // re-entered on every loop() pass while the session is up - the OTA hold
+    // and the post-report linger both return straight into it - so without
+    // it this would publish per pass rather than per session.
+    if (!telemetryTriedThisSession) {
       telemetryTriedThisSession = true;
       // Neither sleepOrIdle() path reboots (ULTRA_LOW_POWER retains state,
       // same as the plain-delay TESTING_MODE path), so setup() never re-runs
