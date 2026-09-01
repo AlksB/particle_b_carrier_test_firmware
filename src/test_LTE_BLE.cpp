@@ -142,7 +142,7 @@ const unsigned long RETRY_INTERVAL_MS =
 // the end before starting over ourselves. Nothing in the connect path blocks
 // for long on our side - the only AT command we send ourselves is a fast
 // +COPS read - so this budget is honoured as written.
-const unsigned long MAX_CONNECT_WAIT_MS = 12UL * 60 * 1000; // 12 minutes
+const unsigned long MAX_CONNECT_WAIT_MS = 2 * 60 * 1000; // 2 minutes
 
 // Safety cap on how long loop() will hold the connection open for an
 // in-flight OTA transfer (see g_otaInProgress below). The binary itself is
@@ -1162,6 +1162,177 @@ static bool publishRfSurvey() {
   return waitForPublish(result, "rf_survey", payload.c_str());
 }
 
+// A connect attempt that ran out of budget, recorded verbatim.
+//
+// A failed session cannot report on itself - there is no cloud connection,
+// that being the whole problem - so the record is stashed here and carried
+// out on whichever later session does connect. The counters already
+// published say a session failed; nothing said why, and by the numbers that
+// is where the pack is going: seven timed-out attempts accounted for 87% of
+// everything drawn from it.
+//
+// Stored as the modem's own reply text rather than parsed fields, and
+// deliberately so. Every parse in this file that guessed at a response shape
+// had to be checked against Device OS or the u-blox manual first, and the
+// interesting failures are the ones nobody predicted - a parser only ever
+// returns the questions it was written to answer. Raw text costs a few
+// hundred bytes and answers questions asked later.
+//
+// The only edits made to that text are the ones the transport forces: CR/LF
+// runs collapse to '|' so a record is one line, control characters are
+// dropped, and '"' becomes '\'' so the payload needs no JSON escaping. The
+// u-blox quotes are only string delimiters, so nothing of meaning is lost.
+struct ConnectFailure {
+  time_t at;           // Time.now() at capture, 0 if the clock was never set
+  uint32_t uptimeSec;  // System.millis()/1000, so records stay orderable and
+                       // ageable on a device that has never had a clock
+  uint16_t searchSec;  // what this one attempt spent looking
+  char raw[384];
+};
+
+// Four is two days of backlog at the failure rate that prompted this (about
+// two a day), against a telemetry cadence that drains it every six hours.
+// Oldest is dropped on overflow, same as the reed queue - a device that has
+// been unreachable for days has a problem the newest records describe just
+// as well.
+const int FAILURE_QUEUE_CAPACITY = 4;
+static retained ConnectFailure g_failureQueue[FAILURE_QUEUE_CAPACITY];
+static retained uint8_t g_failureHead = 0;
+static retained uint8_t g_failureCount = 0;
+
+// Everything worth asking a modem that has just spent its whole budget
+// failing to register. Ordered cheapest-and-most-decisive first, so a
+// truncated record still carries the part that matters.
+//
+// AT+CEER is included unconditionally rather than only under <stat>=3. It
+// reports "the last" unsuccessful attach with no indication of when that
+// was, so on its own it is a trap - but the CEREG reply sits in the same
+// record, three fields earlier, and says whether a rejection just happened.
+// Context disambiguates it, which is exactly what a raw record is for.
+//
+// UMNOPROF and UBANDMASK do not change between attempts and are strictly
+// configuration. They are here because they are the cheapest answer to the
+// question that would otherwise need its own firmware: whether
+// PARTICLE_CELLULAR_PREFERRED_BANDS ever took. Device OS only applies it
+// when AT+UMNOPROF? reads 90 or 100 (sara_ncp_client.cpp:1251), and it
+// parses <MNO> where the interesting value may be <MNO_detected> - the raw
+// reply shows both.
+static const char *const FAILURE_PROBES[] = {
+    "AT+CEREG?\r\n",  "AT+UCGED?\r\n",    "AT+CEER\r\n",
+    "AT+COPS?\r\n",   "AT+CGATT?\r\n",    "AT+CPIN?\r\n",
+    "AT+UMNOPROF?\r\n", "AT+UBANDMASK?\r\n",
+};
+
+// Per-probe ceiling. Every one of these is a local query - none reaches for
+// the network - so the reply is a UART round-trip and this is never
+// approached. It is lower than the 10s the survey and +COPS reads get
+// because there are eight of them here and they run on the path that has
+// already overspent: eight stalled probes at 10s would hold the modem up for
+// 80s at search current, which is most of a short connect attempt's worth of
+// charge spent on diagnostics.
+const unsigned long FAILURE_PROBE_TIMEOUT_MS = 3000;
+
+// Appends one reply line to a fixed buffer, sanitising as it goes. Stops
+// filling at capacity rather than wrapping or reallocating - a truncated
+// record is still a record, and the probe order above puts the decisive
+// replies first.
+struct RawCapture {
+  char *buf;
+  size_t cap;
+  size_t len;
+};
+
+static int rawCaptureCallback(int type, const char *buf, int len,
+                              RawCapture *cap) {
+  if (!buf || !cap) {
+    return WAIT;
+  }
+  for (int i = 0; i < len && cap->len + 1 < cap->cap; i++) {
+    const char c = buf[i];
+    if (c == '\r' || c == '\n') {
+      // One separator per run, and never a leading one.
+      if (cap->len > 0 && cap->buf[cap->len - 1] != '|') {
+        cap->buf[cap->len++] = '|';
+      }
+    } else if (c == '"' || c == '\\') {
+      cap->buf[cap->len++] = '\'';
+    } else if ((unsigned char)c >= 0x20) {
+      cap->buf[cap->len++] = c;
+    }
+  }
+  cap->buf[cap->len] = '\0';
+  return WAIT;
+}
+
+// Runs every probe into the oldest free slot of the ring. Called on the
+// timeout path while the modem is still powered - after Cellular.off() there
+// is nothing left to ask.
+static void captureConnectFailure(unsigned long attemptMs) {
+  if (g_failureCount >= FAILURE_QUEUE_CAPACITY) {
+    g_failureHead = (g_failureHead + 1) % FAILURE_QUEUE_CAPACITY;
+    g_failureCount--;
+  }
+  const uint8_t tail = (g_failureHead + g_failureCount) % FAILURE_QUEUE_CAPACITY;
+  ConnectFailure *entry = &g_failureQueue[tail];
+
+  entry->at = Time.isValid() ? Time.now() : 0;
+  entry->uptimeSec = (uint32_t)(System.millis() / 1000);
+  entry->searchSec = (uint16_t)(attemptMs / 1000);
+  entry->raw[0] = '\0';
+
+  RawCapture cap = {entry->raw, sizeof(entry->raw), 0};
+  for (size_t i = 0; i < sizeof(FAILURE_PROBES) / sizeof(FAILURE_PROBES[0]);
+       i++) {
+    if (cap.len > 0 && cap.len + 1 < cap.cap) {
+      cap.buf[cap.len++] = ';';
+      cap.buf[cap.len] = '\0';
+    }
+    const size_t before = cap.len;
+    Cellular.command(rawCaptureCallback, &cap, FAILURE_PROBE_TIMEOUT_MS,
+                     FAILURE_PROBES[i]);
+    // cellular_command() hands the final result code to readResult() rather
+    // than to the callback, so a probe answering only OK - or erroring, or
+    // timing out - leaves nothing behind. Mark it, otherwise the ';' runs
+    // would silently shift every later reply one probe to the left.
+    if (cap.len == before && cap.len + 1 < cap.cap) {
+      cap.buf[cap.len++] = '-';
+      cap.buf[cap.len] = '\0';
+    }
+  }
+
+  g_failureCount++;
+  Log.info("Recorded connect failure (%u queued): %s", (unsigned)g_failureCount,
+           entry->raw);
+}
+
+// Carries the queue out, oldest first, one event per record. Stops at the
+// first publish the cloud does not acknowledge and leaves the rest queued -
+// same contract as drainReedQueue(), for the same reason: order is
+// information here, and a record dropped because a later one succeeded is a
+// record lost for good.
+//
+// One record per event rather than a batch: a full one is a little under
+// 450 bytes rendered, so two would risk the 1024-byte event ceiling on a
+// payload whose length nobody controls.
+static bool drainFailureQueue() {
+  while (g_failureCount > 0) {
+    const ConnectFailure &e = g_failureQueue[g_failureHead];
+    const uint32_t nowSec = (uint32_t)(System.millis() / 1000);
+    String payload = String::format(
+        "{\"at\":%ld,\"ageSec\":%lu,\"searchSec\":%u,\"raw\":\"%s\"}",
+        (long)e.at, (unsigned long)(nowSec - e.uptimeSec),
+        (unsigned)e.searchSec, e.raw);
+    particle::Future<bool> result =
+        Particle.publish("connect_failure", payload, PRIVATE);
+    if (!waitForPublish(result, "connect_failure", payload.c_str())) {
+      return false;
+    }
+    g_failureHead = (g_failureHead + 1) % FAILURE_QUEUE_CAPACITY;
+    g_failureCount--;
+  }
+  return true;
+}
+
 // Fired as soon as the flip is seen, independent of the telemetry cadence,
 // whenever the reed switch has changed state since the last wake. `changedAt` is captured at poll time
 // (see enqueueReedTransition()), not at publish time, and rendered via
@@ -1652,6 +1823,11 @@ void loop() {
       // return value is ignored on purpose - it changes nothing about
       // whether this slot counts as reported.
       publishRfSurvey();
+      // Last, and its result ignored like the survey's. These records are
+      // already minutes to hours old - whatever they explain is not urgent -
+      // so they yield the session's first publishes to the two events that
+      // are about now. Anything left queued goes out on the next session.
+      drainFailureQueue();
       // A publish the cloud never acknowledged leaves the slot unreported on
       // purpose. This attempt is already spent (counted when the session
       // opened), so the next one comes in RETRY_INTERVAL_MS, or - once the
@@ -1760,6 +1936,10 @@ void loop() {
     Log.info("Connect attempt timed out after %lu ms - modem off, retrying in "
              "%lu ms",
              millis() - wakeStart, RETRY_INTERVAL_MS);
+    // Before anything tears the modem down. sleepOrIdle() below calls
+    // Cellular.off(), and once that has run there is nothing left to ask -
+    // this is the last moment the radio can still describe why it failed.
+    captureConnectFailure(millis() - wakeStart);
     Particle.disconnect(CloudDisconnectOptions().clearSession(true));
     reporting = false;
     lastAttemptEndMs = millis();
