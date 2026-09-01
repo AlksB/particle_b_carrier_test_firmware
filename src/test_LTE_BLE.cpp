@@ -134,14 +134,31 @@ const unsigned long RETRY_INTERVAL_MS =
 // loop()) - as long as something is queued to report, attempts just keep
 // coming - so this is a per-attempt budget, not a per-wake one.
 //
-// It sits deliberately above Device OS's own REGISTRATION_TIMEOUT of 10
-// minutes, at which it resets the modem as a last resort. Its escalation
-// ladder (AT+COPS=0,2 PLMN reselection once registration goes sticky, an RF
-// reset via CFUN cycling when it is denied, then that modem reset) is
-// strictly better informed than our blunt power-cycle, so we let it run to
-// the end before starting over ourselves. Nothing in the connect path blocks
-// for long on our side - the only AT command we send ourselves is a fast
-// +COPS read - so this budget is honoured as written.
+// This used to be 12 minutes, chosen to sit above Device OS's own
+// REGISTRATION_TIMEOUT of 10 so its escalation ladder could run to the end
+// before we started over. That reasoning does not survive reading the
+// timings: REGISTRATION_CHECK_INTERVAL is 15 seconds
+// (sara_ncp_client.cpp:127), so the ladder that matters - AT+COPS=0,2 once
+// registration goes sticky, AT+CGACT=1 when the bearer will not come up -
+// runs from the first quarter-minute and is not skipped by any budget worth
+// setting. The full ten minutes buys exactly one thing: Device OS's terminal
+// modem reset. And that is the one escalation we already duplicate, because
+// the timeout path calls Cellular.off() and waits for it to confirm, which
+// makes the next attempt a genuinely cold registration.
+//
+// So the old value spent minutes at search current waiting for a reset it
+// was about to perform itself. Against the firmware's own phase currents
+// that was 44.3 mAh per failed attempt, against 8.5 mAh at this value -
+// seven failures in three and a half days came to 87% of everything drawn
+// from the pack, and moving them off the 12-minute budget is the difference
+// between roughly a fortnight and roughly two months on a charge.
+//
+// The risk this takes on is reachability: a device whose coverage needs
+// longer than this never registers, and a device that never registers
+// cannot be reached by OTA either. The failure records now published (see
+// captureConnectFailure()) are what will say whether that is real - every
+// successful attach observed so far completed in about 13 seconds, which is
+// the only reason a budget this much shorter is defensible yet.
 const unsigned long MAX_CONNECT_WAIT_MS = 2 * 60 * 1000; // 2 minutes
 
 // Safety cap on how long loop() will hold the connection open for an
@@ -368,7 +385,7 @@ static retained uint32_t g_cloudConnectSuccesses = 0;
 // very different amounts: searching and registering runs the transmitter
 // at high power in bursts, while a registered modem with the interface up
 // sits in the low milliamps. A cycle that gives up at MAX_CONNECT_WAIT_MS
-// burns eight minutes of the expensive kind, one that connects straight
+// burns that whole budget of the expensive kind, one that connects straight
 // away burns seconds of it, and g_cloudConnectAttemptsCount counts both as
 // 1 - which is why it only works as a charge proxy for as long as the
 // per-cycle radio cost stays close to what the calibration run saw. These
@@ -1187,7 +1204,14 @@ struct ConnectFailure {
   uint32_t uptimeSec;  // System.millis()/1000, so records stay orderable and
                        // ageable on a device that has never had a clock
   uint16_t searchSec;  // what this one attempt spent looking
-  char raw[384];
+  // Sized against the worst case rather than a guess. The bounded probes
+  // come to about 291 characters with their separators - UCGED alone is
+  // ~130 across its three lines, and a registered CEREG reply another 31 -
+  // which leaves roughly 220 for AT+CEER, the one reply whose length the
+  // manual will not commit to ("one or more lines of information text").
+  // 384 was 8 bytes short of the worst case and would have truncated
+  // exactly the configuration probes this exists to carry.
+  char raw[512];
 };
 
 // Four is two days of backlog at the failure rate that prompted this (about
@@ -1201,13 +1225,22 @@ static retained uint8_t g_failureHead = 0;
 static retained uint8_t g_failureCount = 0;
 
 // Everything worth asking a modem that has just spent its whole budget
-// failing to register. Ordered cheapest-and-most-decisive first, so a
-// truncated record still carries the part that matters.
+// failing to register.
 //
-// AT+CEER is included unconditionally rather than only under <stat>=3. It
-// reports "the last" unsuccessful attach with no indication of when that
-// was, so on its own it is a trap - but the CEREG reply sits in the same
-// record, three fields earlier, and says whether a rejection just happened.
+// Two rules set the order. Most decisive first, so a truncated record still
+// carries the part that matters - CEREG says what state registration
+// reached, UCGED whether a cell was even found. And every reply of known,
+// bounded length before the one that has none: AT+CEER is documented only
+// as "one or more lines of information text", so it goes last, where a
+// verbose answer can only cost its own tail. Put earlier, it would push out
+// the configuration probes instead - which is the opposite of what should
+// survive.
+//
+// AT+CEER is included unconditionally rather than only under CEREG <stat>=3.
+// It reports "the last" unsuccessful attach with no indication of when that
+// was, so on its own it is a trap - a search that never drew a rejection
+// would carry a cause from days earlier. But the CEREG reply sits at the
+// front of the same record and says whether a rejection just happened.
 // Context disambiguates it, which is exactly what a raw record is for.
 //
 // UMNOPROF and UBANDMASK do not change between attempts and are strictly
@@ -1215,12 +1248,13 @@ static retained uint8_t g_failureCount = 0;
 // question that would otherwise need its own firmware: whether
 // PARTICLE_CELLULAR_PREFERRED_BANDS ever took. Device OS only applies it
 // when AT+UMNOPROF? reads 90 or 100 (sara_ncp_client.cpp:1251), and it
-// parses <MNO> where the interesting value may be <MNO_detected> - the raw
-// reply shows both.
+// matches on <MNO> where the value actually applied may be <MNO_detected> -
+// the raw reply shows both, and UBANDMASK beside it says whether the mask is
+// the intended 0,6170,0 or the factory 14-band default.
 static const char *const FAILURE_PROBES[] = {
-    "AT+CEREG?\r\n",  "AT+UCGED?\r\n",    "AT+CEER\r\n",
-    "AT+COPS?\r\n",   "AT+CGATT?\r\n",    "AT+CPIN?\r\n",
-    "AT+UMNOPROF?\r\n", "AT+UBANDMASK?\r\n",
+    "AT+CEREG?\r\n",     "AT+UCGED?\r\n",      "AT+COPS?\r\n",
+    "AT+CGATT?\r\n",     "AT+CPIN?\r\n",       "AT+UMNOPROF?\r\n",
+    "AT+UBANDMASK?\r\n", "AT+CEER\r\n",
 };
 
 // Per-probe ceiling. Every one of these is a local query - none reaches for
@@ -1311,9 +1345,9 @@ static void captureConnectFailure(unsigned long attemptMs) {
 // information here, and a record dropped because a later one succeeded is a
 // record lost for good.
 //
-// One record per event rather than a batch: a full one is a little under
-// 450 bytes rendered, so two would risk the 1024-byte event ceiling on a
-// payload whose length nobody controls.
+// One record per event rather than a batch: a full one renders to roughly
+// 580 bytes, so two would blow the 1024-byte event ceiling on a payload
+// whose length nobody controls.
 static bool drainFailureQueue() {
   while (g_failureCount > 0) {
     const ConnectFailure &e = g_failureQueue[g_failureHead];
