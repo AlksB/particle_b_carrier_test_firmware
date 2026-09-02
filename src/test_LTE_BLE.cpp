@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 34;
+const int FIRMWARE_VERSION = 35;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -621,7 +621,10 @@ struct UcgedServingCell {
   unsigned physicalCellId;
   unsigned rsrpIndex;
   int rsrqIndex;
-  int sinr;
+  // Float, unlike everything around it, because the modem reports it that
+  // way: "15.81", not "15". Reading it with %d used to stop the sscanf below
+  // dead on the '.', which cost every field after it - see there.
+  float sinr;
   int rrcState;
   int rankIndicator;
   int cqi;
@@ -673,10 +676,20 @@ static int ucgedCallback(int type, const char *buf, int len,
   unsigned earfcn = 0, band = 0, ulBw = 0, dlBw = 0, tac = 0, pci = 0,
            rsrp = 0;
   unsigned long cellId = 0;
-  int rsrq = 0, sinr = -1, rrc = -1, ri = -1, cqi = -1, avgRsrp = -1,
-      pusch = -1, pucch = -1;
+  int rsrq = 0, rrc = -1, ri = -1, cqi = -1, avgRsrp = -1, pusch = -1,
+      pucch = -1;
+  // SINR is the one non-integer field in the row and needs %f. With %d it
+  // matched the "15" of "15.81", stopped at the '.', and every conversion
+  // after it failed - so rrc, ri, cqi, avgRsrp and the two power fields
+  // published as -1 in all 623 events of the first run, reading as "not
+  // reported" when the modem had in fact reported them. The values were
+  // never lost, ucgedRaw carries the row verbatim, but nothing downstream
+  // could use them without re-parsing it. Float scanf is linked on this
+  // platform (-u _scanf_float, hal/src/nRF52840/include.mk:65), so this is
+  // not the newlib-nano trap it looks like.
+  float sinr = -1.0f;
   int matched = sscanf(
-      start, "%u,%u,%u,%u,%x,%lx,%u,%*x,%*x,%*x,%u,%d,%d,%d,%d,%d,%d,%d,%d",
+      start, "%u,%u,%u,%u,%x,%lx,%u,%*x,%*x,%*x,%u,%d,%f,%d,%d,%d,%d,%d,%d",
       &earfcn, &band, &ulBw, &dlBw, &tac, &cellId, &pci, &rsrp, &rsrq, &sinr,
       &rrc, &ri, &cqi, &avgRsrp, &pusch, &pucch);
   // Nine assignments reaches RSRQ, the point at which the row is
@@ -1144,7 +1157,7 @@ static bool publishRfSurvey() {
     return false;
   }
 
-  Log.info("rf earfcn=%u band=%u pci=%u cell=0x%08lx sinr=%d cqi=%d "
+  Log.info("rf earfcn=%u band=%u pci=%u cell=0x%08lx sinr=%.2f cqi=%d "
            "pusch=%d pucch=%d",
            cell.earfcn, cell.band, cell.physicalCellId,
            (unsigned long)cell.cellId, cell.sinr, cell.cqi, cell.puschPower,
@@ -1161,7 +1174,7 @@ static bool publishRfSurvey() {
       "\"pci\":%u,"
       "\"rsrpIdx\":%u,"
       "\"rsrqIdx\":%d,"
-      "\"sinr\":%d,"
+      "\"sinr\":%.2f,"
       "\"rrc\":%d,"
       "\"ri\":%d,"
       "\"cqi\":%d,"
