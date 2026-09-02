@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 33;
+const int FIRMWARE_VERSION = 34;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -1204,13 +1204,16 @@ struct ConnectFailure {
   uint32_t uptimeSec;  // System.millis()/1000, so records stay orderable and
                        // ageable on a device that has never had a clock
   uint16_t searchSec;  // what this one attempt spent looking
-  // Sized against the worst case rather than a guess. The bounded probes
-  // come to about 291 characters with their separators - UCGED alone is
-  // ~130 across its three lines, and a registered CEREG reply another 31 -
-  // which leaves roughly 220 for AT+CEER, the one reply whose length the
-  // manual will not commit to ("one or more lines of information text").
-  // 384 was 8 bytes short of the worst case and would have truncated
-  // exactly the configuration probes this exists to carry.
+  // Sized against the worst case rather than a guess. Measured against a
+  // real record rather than estimated: the seven bounded probes came to 254
+  // characters with their separators, UCGED alone ~130 across its three
+  // lines. CGACT adds ~16 and a single-context CGDCONT ~66, so a typical
+  // record now lands near 335 and leaves ~175 for AT+CEER, the one reply
+  // whose length the manual will not commit to ("one or more lines of
+  // information text") - observed at 38. Each extra PDP context CGDCONT has
+  // to list costs another ~65, so a module carrying four of them is where
+  // this buffer starts truncating from the tail. 384 was 8 bytes short of
+  // the worst case even before those two probes existed.
   char raw[512];
 };
 
@@ -1220,6 +1223,32 @@ struct ConnectFailure {
 // been unreachable for days has a problem the newest records describe just
 // as well.
 const int FAILURE_QUEUE_CAPACITY = 4;
+
+// Records go out paced rather than back to back. Device OS rejects the fifth
+// event inside a one-second window on the device itself - Publisher::
+// is_rate_limited() keeps a five-deep ring of publish times and answers
+// BANDWIDTH_EXCEEDED without the event ever reaching the air
+// (communication/src/publisher.h:50, publisher.cpp:37) - and a session that
+// has already sent telemetry and rf_survey has two of that allowance spent
+// before the first record is even offered. Unpaced, the drain therefore
+// stopped after two records every time and left the rest queued for the next
+// session; on a real device that cost four of ten records in one morning,
+// the newest failures pushing out records the drain had never been given a
+// chance to send. The device counted the rejections itself: `rate_limited`
+// in vitals stepped once per throttled session.
+//
+// 350ms puts the fifth publish of a session a little past the window that
+// started with its telemetry. That is the arithmetic, and the retry below is
+// what makes it safe - the spacing only has to make retries rare, not
+// impossible, because a session that also drains a reed transition spends
+// the allowance differently.
+const unsigned long FAILURE_PUBLISH_SPACING_MS = 350;
+
+// One retry, and only after the whole window has rolled past. A rejected
+// publish still writes its timestamp into that limiter ring before the check
+// (publisher.h:78), so retrying straight away is guaranteed to fail again
+// and to push the window out further.
+const unsigned long FAILURE_PUBLISH_RETRY_MS = 1100;
 static retained ConnectFailure g_failureQueue[FAILURE_QUEUE_CAPACITY];
 static retained uint8_t g_failureHead = 0;
 static retained uint8_t g_failureCount = 0;
@@ -1228,20 +1257,62 @@ static retained uint8_t g_failureCount = 0;
 // failing to register.
 //
 // Two rules set the order. Most decisive first, so a truncated record still
-// carries the part that matters - CEREG says what state registration
-// reached, UCGED whether a cell was even found. And every reply of known,
+// carries the part that matters - COPS says whether a network was joined at
+// all, UCGED whether a cell was even found. And every reply of known,
 // bounded length before the one that has none: AT+CEER is documented only
 // as "one or more lines of information text", so it goes last, where a
 // verbose answer can only cost its own tail. Put earlier, it would push out
 // the configuration probes instead - which is the opposite of what should
 // survive.
 //
-// AT+CEER is included unconditionally rather than only under CEREG <stat>=3.
-// It reports "the last" unsuccessful attach with no indication of when that
-// was, so on its own it is a trap - a search that never drew a rejection
-// would carry a cause from days earlier. But the CEREG reply sits at the
-// front of the same record and says whether a rejection just happened.
-// Context disambiguates it, which is exactly what a raw record is for.
+// AT+CEREG? led this list until the first records came back off a device
+// carrying nothing for it but an OK. It cannot be asked from here at all:
+// Device OS registers a URC handler for "+CEREG" (sara_ncp_client.cpp:330,
+// alongside "+CREG" at :249 and "+CGREG" at :286), and the parser matches
+// URC prefixes while reading a command's response, not only between
+// commands - hasNextLine() and readLine() both parse with
+// PARSE_RESULT | PARSE_URC (at_parser_impl.cpp:224, :249). On a match the
+// line is handed to that handler and then discarded (:381-405), so it never
+// reaches the callback cellular_command() drives, and only the final result
+// code is left. All three registration queries are subscribed that way, so
+// there is no substitute to swap in - which costs less than it sounds,
+// because +COPS: and +CGATT: carry registration and attach state between
+// them and come through untouched.
+//
+// AT+CGACT? and AT+CGDCONT? are here because in EPS the attach and the PDN
+// connectivity request are one procedure: the Attach Request carries the ESM
+// request that brings up the default bearer, which is why a context problem
+// surfaces as a *registration* reject rather than as a separate failure, and
+// why EMM cause 19 ("ESM failure") exists at all. Two records off real
+// devices have carried that cause, one at -100 dBm and one at -90 dBm with
+// 18 dB of SINR, so whatever it is, it is not the radio.
+//
+// CGACT sits beside CGATT because they are the same question one layer
+// apart - attached, and is a context actually up - and both answer in a
+// dozen characters. CGDCONT is the speculative one: it says which APN and
+// PDP type the attach would have asked for. Two caveats keep it honest.
+// Device OS reads and repairs that context before every attach
+// (sara_ncp_client.cpp:2166-2215), so this reads the value after any repair
+// - it tests the precondition, not the event. And the SARA-R5 manual notes
+// that outside the Verizon profile the +CGDCONT entries are synchronised at
+// power-on with LwM2M object 11, where the operator's server can mark an APN
+// disabled, after which the module rejects its activation locally; this
+// firmware power-cycles the modem every wake, so it passes through that
+// synchronisation hundreds of times a day. That is the one hypothesis on
+// this list the device can still test by itself.
+//
+// It goes second to last for the same reason CEER goes last: it is the only
+// other reply whose length is not fixed, because the read returns every
+// defined context rather than one. Three contexts still fit; a module that
+// has accumulated more would start costing CEER its tail, which is the
+// trade this order accepts knowingly.
+//
+// AT+CEER is included unconditionally rather than only under a known
+// rejection. It reports "the last" unsuccessful attach with no indication of
+// when that was, so on its own it is a trap - a search that never drew a
+// rejection would carry a cause from days earlier. But COPS and CGATT sit in
+// front of it in the same record and say whether one just happened. Context
+// disambiguates it, which is exactly what a raw record is for.
 //
 // UMNOPROF and UBANDMASK do not change between attempts and are strictly
 // configuration. They are here because they are the cheapest answer to the
@@ -1252,9 +1323,9 @@ static retained uint8_t g_failureCount = 0;
 // the raw reply shows both, and UBANDMASK beside it says whether the mask is
 // the intended 0,6170,0 or the factory 14-band default.
 static const char *const FAILURE_PROBES[] = {
-    "AT+CEREG?\r\n",     "AT+UCGED?\r\n",      "AT+COPS?\r\n",
-    "AT+CGATT?\r\n",     "AT+CPIN?\r\n",       "AT+UMNOPROF?\r\n",
-    "AT+UBANDMASK?\r\n", "AT+CEER\r\n",
+    "AT+COPS?\r\n",      "AT+UCGED?\r\n",     "AT+CGATT?\r\n",
+    "AT+CGACT?\r\n",     "AT+CPIN?\r\n",      "AT+UMNOPROF?\r\n",
+    "AT+UBANDMASK?\r\n", "AT+CGDCONT?\r\n",   "AT+CEER\r\n",
 };
 
 // Per-probe ceiling. Every one of these is a local query - none reaches for
@@ -1265,6 +1336,12 @@ static const char *const FAILURE_PROBES[] = {
 // 80s at search current, which is most of a short connect attempt's worth of
 // charge spent on diagnostics.
 const unsigned long FAILURE_PROBE_TIMEOUT_MS = 3000;
+
+// Ceiling for the bare AT that gates the probe list. A local echo is a UART
+// round-trip; a modem that cannot answer one inside half a second will not
+// answer seven more, and waiting longer only spends the charge the gate
+// exists to save.
+const unsigned long FAILURE_LIVENESS_TIMEOUT_MS = 500;
 
 // Appends one reply line to a fixed buffer, sanitising as it goes. Stops
 // filling at capacity rather than wrapping or reallocating - a truncated
@@ -1298,6 +1375,16 @@ static int rawCaptureCallback(int type, const char *buf, int len,
   return WAIT;
 }
 
+// Appends a short marker - never a reply, always something this code chose -
+// stopping at capacity like the callback above and leaving the buffer
+// terminated either way.
+static void appendMarker(RawCapture *cap, const char *mark) {
+  while (*mark && cap->len + 1 < cap->cap) {
+    cap->buf[cap->len++] = *mark++;
+  }
+  cap->buf[cap->len] = '\0';
+}
+
 // Runs every probe into the oldest free slot of the ring. Called on the
 // timeout path while the modem is still powered - after Cellular.off() there
 // is nothing left to ask.
@@ -1315,22 +1402,40 @@ static void captureConnectFailure(unsigned long attemptMs) {
   entry->raw[0] = '\0';
 
   RawCapture cap = {entry->raw, sizeof(entry->raw), 0};
-  for (size_t i = 0; i < sizeof(FAILURE_PROBES) / sizeof(FAILURE_PROBES[0]);
-       i++) {
-    if (cap.len > 0 && cap.len + 1 < cap.cap) {
-      cap.buf[cap.len++] = ';';
-      cap.buf[cap.len] = '\0';
-    }
-    const size_t before = cap.len;
-    Cellular.command(rawCaptureCallback, &cap, FAILURE_PROBE_TIMEOUT_MS,
-                     FAILURE_PROBES[i]);
-    // cellular_command() hands the final result code to readResult() rather
-    // than to the callback, so a probe answering only OK - or erroring, or
-    // timing out - leaves nothing behind. Mark it, otherwise the ';' runs
-    // would silently shift every later reply one probe to the left.
-    if (cap.len == before && cap.len + 1 < cap.cap) {
-      cap.buf[cap.len++] = '-';
-      cap.buf[cap.len] = '\0';
+
+  // One bare AT before the seven below. Each of those has a 3s ceiling and a
+  // modem that has already been torn down answers none of them, so the
+  // record costs 21s at search current and carries nothing - which is what
+  // five of the first six records off a real device were, every one of them
+  // after the first failure of a burst. The check has to be on what
+  // Cellular.command() returns rather than on what the callback saw: a bare
+  // AT answers OK, readResult() takes it, and the callback is never called
+  // at all (RESP_OK / RESP_ERROR from cellular_hal.cpp:82, WAIT on timeout;
+  // the values are in cellular_enums_hal.h:304).
+  if (Cellular.command(FAILURE_LIVENESS_TIMEOUT_MS, "AT\r\n") != RESP_OK) {
+    appendMarker(&cap, "modem-silent");
+  } else {
+    for (size_t i = 0; i < sizeof(FAILURE_PROBES) / sizeof(FAILURE_PROBES[0]);
+         i++) {
+      if (cap.len > 0 && cap.len + 1 < cap.cap) {
+        cap.buf[cap.len++] = ';';
+        cap.buf[cap.len] = '\0';
+      }
+      const size_t before = cap.len;
+      const int res = Cellular.command(rawCaptureCallback, &cap,
+                                       FAILURE_PROBE_TIMEOUT_MS,
+                                       FAILURE_PROBES[i]);
+      // cellular_command() hands the final result code to readResult() rather
+      // than to the callback, so a probe answering only OK - or erroring, or
+      // timing out - leaves nothing behind. Record which of those it was: a
+      // single '-' for all three, as this used to write, cannot tell a dead
+      // modem from a reply that arrived and was routed elsewhere, and that is
+      // exactly the distinction the empty records above turned on. The marker
+      // also keeps the ';' runs aligned - without one, every later reply
+      // would shift a probe to the left.
+      if (cap.len == before) {
+        appendMarker(&cap, res == RESP_OK ? "ok" : (res == WAIT ? "x" : "err"));
+      }
     }
   }
 
@@ -1349,17 +1454,34 @@ static void captureConnectFailure(unsigned long attemptMs) {
 // 580 bytes, so two would blow the 1024-byte event ceiling on a payload
 // whose length nobody controls.
 static bool drainFailureQueue() {
+  bool spaced = false;
   while (g_failureCount > 0) {
     const ConnectFailure &e = g_failureQueue[g_failureHead];
+    // Recomputed per record: ageSec is meant to be the age at publish, and
+    // the pacing below now puts real time between one record and the next.
     const uint32_t nowSec = (uint32_t)(System.millis() / 1000);
     String payload = String::format(
         "{\"at\":%ld,\"ageSec\":%lu,\"searchSec\":%u,\"raw\":\"%s\"}",
         (long)e.at, (unsigned long)(nowSec - e.uptimeSec),
         (unsigned)e.searchSec, e.raw);
+    if (spaced) {
+      delay(FAILURE_PUBLISH_SPACING_MS);
+    }
+    spaced = true;
     particle::Future<bool> result =
         Particle.publish("connect_failure", payload, PRIVATE);
     if (!waitForPublish(result, "connect_failure", payload.c_str())) {
-      return false;
+      // Second and last attempt. Anything that survives a wait this long is
+      // not the rate limiter, and the queue is better left intact for the
+      // next session than emptied into a connection that is going away -
+      // same contract as before, just no longer triggered by the one failure
+      // that was always going to clear on its own.
+      delay(FAILURE_PUBLISH_RETRY_MS);
+      particle::Future<bool> retry =
+          Particle.publish("connect_failure", payload, PRIVATE);
+      if (!waitForPublish(retry, "connect_failure", payload.c_str())) {
+        return false;
+      }
     }
     g_failureHead = (g_failureHead + 1) % FAILURE_QUEUE_CAPACITY;
     g_failureCount--;
