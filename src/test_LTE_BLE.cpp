@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 35;
+const int FIRMWARE_VERSION = 36;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -134,32 +134,50 @@ const unsigned long RETRY_INTERVAL_MS =
 // loop()) - as long as something is queued to report, attempts just keep
 // coming - so this is a per-attempt budget, not a per-wake one.
 //
-// This used to be 12 minutes, chosen to sit above Device OS's own
-// REGISTRATION_TIMEOUT of 10 so its escalation ladder could run to the end
-// before we started over. That reasoning does not survive reading the
-// timings: REGISTRATION_CHECK_INTERVAL is 15 seconds
-// (sara_ncp_client.cpp:127), so the ladder that matters - AT+COPS=0,2 once
-// registration goes sticky, AT+CGACT=1 when the bearer will not come up -
-// runs from the first quarter-minute and is not skipped by any budget worth
-// setting. The full ten minutes buys exactly one thing: Device OS's terminal
-// modem reset. And that is the one escalation we already duplicate, because
-// the timeout path calls Cellular.off() and waits for it to confirm, which
-// makes the next attempt a genuinely cold registration.
+// It was 12 minutes once, to sit above Device OS's REGISTRATION_TIMEOUT of
+// 10 so its escalation ladder could finish, then 2 minutes once that was
+// measured rather than assumed. It is now 60 seconds, and this time the
+// number comes from the fleet rather than from reasoning about it.
 //
-// So the old value spent minutes at search current waiting for a reset it
-// was about to perform itself. Against the firmware's own phase currents
-// that was 44.3 mAh per failed attempt, against 8.5 mAh at this value -
-// seven failures in three and a half days came to 87% of everything drawn
-// from the pack, and moving them off the 12-minute budget is the difference
-// between roughly a fortnight and roughly two months on a charge.
+// 1417 successful attaches have been measured, by differencing the
+// modemSearchSec and modemReadySec counters across cycles that contained
+// exactly one attempt and it succeeded. p50 16s, p90 19s, p99 28s, and the
+// slowest of all 1417 took 43s. Not one attach has ever completed later
+// than that. So a 60s budget loses nothing observed and keeps 17s of head
+// room over the worst case; 45s would keep only 2s, and 30s would have cut
+// 14 real successes.
 //
-// The risk this takes on is reachability: a device whose coverage needs
-// longer than this never registers, and a device that never registers
-// cannot be reached by OTA either. The failure records now published (see
-// captureConnectFailure()) are what will say whether that is real - every
-// successful attach observed so far completed in about 13 seconds, which is
-// the only reason a budget this much shorter is defensible yet.
-const unsigned long MAX_CONNECT_WAIT_MS = 2 * 60 * 1000; // 2 minutes
+// Nothing is given up by ending an attempt at 60s either, and that is the
+// part worth writing down, because it is specific to the SIMs this fleet
+// carries. interveneRegistration() opens with
+//
+//   if (netConf_.netProv() == CellularNetworkProvider::TWILIO &&
+//       millis() - regStartTime_ <= REGISTRATION_TWILIO_HOLDOFF_TIMEOUT) return 0;
+//
+// (sara_ncp_client.cpp:2614) and that hold-off is five minutes
+// (:130). These are Twilio Super SIMs - the ICCIDs start 8988307, which
+// network_config_db.cpp:45 maps to CellularNetworkProvider::TWILIO - so for
+// the first five minutes of every registration Device OS performs no
+// interventions at all. No PLMN reselection, no RF reset. Its ladder has
+// never once run inside a budget this fleet has ever used, at 12 minutes or
+// at 2. There is no recovery machinery here to cut short.
+//
+// What the budget does buy is the modem's own scanning, and the evidence
+// says that is finished well before 43s or not at all: every failure record
+// captured so far spent the full budget and came back with an explicit
+// network reject cause, not a timeout.
+//
+// Cost per failed attempt, against the firmware's own phase currents, is
+// about 4.9 mAh here against 8.5 at 2 minutes and 44.3 at 12. At the
+// failure rate this fleet is currently seeing - 69 of 600 attempts in 16
+// hours - that is roughly 250 mAh a day back.
+//
+// The risk taken on is reachability, unchanged from before: a device whose
+// coverage needs longer than this never registers, and one that never
+// registers cannot be reached by OTA either. The measurement above is from
+// three devices on one windowsill over three days in good coverage. Re-run
+// it before carrying this number to a site that is not this one.
+const unsigned long MAX_CONNECT_WAIT_MS = 60 * 1000; // 60 seconds
 
 // Safety cap on how long loop() will hold the connection open for an
 // in-flight OTA transfer (see g_otaInProgress below). The binary itself is
