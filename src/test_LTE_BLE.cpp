@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 36;
+const int FIRMWARE_VERSION = 37;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -323,34 +323,45 @@ static int batteryPercentFromVoltage(float vbat) {
 // averaged 187mA registered against 72mA on its way down, a factor of 2.6
 // that a single constant would have to split the difference on.
 //
-// The constants are the worst figure each phase produced across four PPK
-// captures, not the typical one - "full power", as the pack should be
-// budgeted. The reason the worst and the typical differ so much is a carrier
-// re-steer that happened mid-test: the SARA-R510S moved from T-Mobile to
-// AT&T, RSRQ fell from -13.5 to -17.5dB, and Cat-M1 answered by repeating
-// transmissions until a fixed-size DTLS handshake took 4148ms instead of
-// 211ms. That is the same 1.5-2x on current, and nothing in the firmware
-// chooses it or can see it coming. So the budget assumes it is always the
-// case:
+// The phase currents come from four PPK captures rescaled by three full
+// field discharges. The captures got the ratios between the phases right
+// and the absolute level wrong by about 5x: they are bench captures taken
+// at full power, and a pack in the field never sustains that. The reason
+// the captures spread so widely among themselves is a carrier re-steer
+// mid-test: the SARA-R510S moved from T-Mobile to AT&T, RSRQ fell from
+// -13.5 to -17.5dB, and Cat-M1 answered by repeating transmissions until a
+// fixed-size DTLS handshake took 4148ms instead of 211ms.
 //
-//   phase      T-Mobile      AT&T      constant
-//   search     169  139      213  159    215mA
-//   ready      187  213      364  339    365mA
-//   offgoing    72  126      218  247    250mA
+//   phase      T-Mobile      AT&T     PPK worst   x0.213
+//   search     169  139      213  159    215mA      46mA
+//   ready      187  213      364  339    365mA      78mA
+//   offgoing    72  126      218  247    250mA      53mA
 //
 // (two captures per carrier; integrated over exactly the intervals these
 // timers count, taken from the phase-transition log lines, aligned to the
 // current trace by cross-correlating the modem-active window)
 //
-// On a good cell the gauge therefore falls roughly twice as fast as the pack
-// really empties, bottoms out at the 38% floor, and hands over to voltage.
-// It reports the pack pessimistically, never optimistically.
+// The 0.213 is one scale factor fitted to devices 010, 021 and 002 over
+// their whole packs - 86, 170 and 192 hours, ending at 4.15V, 5.41V and
+// 4.29V - with charge drawn read back through batteryPercentFromVoltage()
+// and the idle term below subtracted first. Each device implies its own
+// scale (0.213, 0.191, 0.206); the constant takes the largest, so the gauge
+// stays pessimistic against all three. That the three agree within 11% is
+// what says the PPK ratios were sound - it is only the level that moved.
+// The unscaled constants claimed those three packs had delivered 5599,
+// 6143 and 6890mAh, which two CR123A cells in series cannot do: in series
+// they carry one cell's capacity, 1500mAh, at twice the voltage.
 //
-// What this does NOT count is the sleeping board, ~0.4mA, which at the
-// 12-hour field cadence is comparable to the modem's own share. The estimate
-// is a modem-airtime budget by construction; fold in an idle term once a
-// full discharge run on the final configuration says what the baseline
-// really is with the reed open.
+// The idle term is the sleeping board, 60uA measured on this carrier board
+// in ULTRA_LOW_POWER, charged against wall-clock time on the pack rather
+// than modem time. Across those three discharges it came to 4-10mAh out of
+// 1200-1400, small enough not to matter. It is carried because of the field
+// cadence, where it is the larger of the two: at one report per 12h a
+// healthy session costs 1.21mAh/day of radio against 1.44mAh/day of sleep,
+// and a pack lasts about 1.5 years with sleep taking 54% of the budget.
+// (An earlier revision of this comment guessed ~0.4mA here without ever
+// measuring it - close to the M-SoM's published ULP figure, which is a
+// different module. This board sleeps 8.6x below that.)
 //
 // The timers read "on this pack" only because a battery swap cuts power and
 // retained SRAM does not survive that. If a pack is ever swapped with the
@@ -358,22 +369,31 @@ static int batteryPercentFromVoltage(float vbat) {
 // soon as the pack leaves the plateau, and the floor keeps it from ever
 // claiming near-dead on a healthy cell.
 static int batteryPercentEstimate(float vbat, uint64_t searchMs,
-                                  uint64_t readyMs, uint64_t offgoingMs) {
+                                  uint64_t readyMs, uint64_t offgoingMs,
+                                  uint64_t elapsedMs) {
   // Nominal capacity of the pack. The two CR123A cells are in series, so the
   // pack carries one cell's capacity at twice the voltage, not two cells'.
   static const float PACK_CAPACITY_MAH = 1500.0f;
-  // Per-phase currents, worst measured. See the table above.
-  static const float SEARCH_MA = 215.0f;
-  static const float READY_MA = 365.0f;
-  static const float OFFGOING_MA = 250.0f;
+  // Per-phase currents, PPK ratios scaled to the field discharges. See the
+  // table above.
+  static const float SEARCH_MA = 46.0f;
+  static const float READY_MA = 78.0f;
+  static const float OFFGOING_MA = 53.0f;
+  // The sleeping board, measured. Charged against wall-clock time, not
+  // modem time - it is drawn whether or not the modem ever came on.
+  static const float SLEEP_MA = 0.060f;
   static const float AMBIGUOUS_BAND_LOW_V = 5.68f;
 
   if (vbat < AMBIGUOUS_BAND_LOW_V) {
     return batteryPercentFromVoltage(vbat);
   }
 
+  // elapsedMs covers the modem-on time too, so the sleep current is counted
+  // during it as well. That is 0.14% on top of a phase current and not worth
+  // subtracting out; carrying it keeps the term from ever reading low.
   float usedMah = ((float)searchMs * SEARCH_MA + (float)readyMs * READY_MA +
-                   (float)offgoingMs * OFFGOING_MA) /
+                   (float)offgoingMs * OFFGOING_MA +
+                   (float)elapsedMs * SLEEP_MA) /
                   3600000.0f;
   float pct = 100.0f * (1.0f - usedMah / PACK_CAPACITY_MAH);
   // Voltage this high was never observed below ~37% on the calibration pack,
@@ -423,6 +443,74 @@ static retained uint32_t g_cloudConnectSuccesses = 0;
 static retained uint64_t g_modemSearchMs = 0;   // powered, not registered yet
 static retained uint64_t g_modemReadyMs = 0;    // registered, interface up
 static retained uint64_t g_modemOffgoingMs = 0; // detaching and powering down
+
+// Wall-clock time on this battery pack, in milliseconds - the idle term of
+// batteryPercentEstimate(). Same "on this pack" semantics as the timers
+// above, and retained for the same reason.
+//
+// System.millis() advances across sleep, for any sleep length. Worth
+// spelling out, because the counter this term depends on is maintained by
+// an interrupt and we sleep with interrupts masked.
+//
+// millis() is RTC2: a 24-bit counter on the 32768Hz LFCLK plus a software
+// overflow count (hal/src/nRF52840/timer_hal.cpp:66). The counter wraps
+// every 512s, so the software half is what carries anything longer.
+//
+// The hardware half is free: RTC2 runs in System ON regardless of what the
+// CPU is doing, and ULTRA_LOW_POWER is System ON with the core in __WFI().
+// It is also the wake source itself - it has to keep running.
+//
+// The software half survives because an overflow still gets serviced mid-
+// sleep. RTC2's overflow interrupt is enabled when the timebase starts
+// (timer_hal.cpp:251,263) and sleep_hal never disables it - it only bumps
+// RTC2's NVIC priority. Device OS does mask interrupts around __WFI()
+// (sleep_hal.cpp:1064,1074), but __WFI() still wakes the core on any pending
+// enabled interrupt even with PRIMASK set; the exception just isn't taken
+// yet. The loop then finds the wake source isn't the one we asked for, calls
+// __enable_irq() (sleep_hal.cpp:1123) - at which point the pending overflow
+// handler finally runs and bumps the count - masks again and goes back to
+// __WFI(). So a long sleep is silently punctuated by a brief wake every
+// 512s, which costs a handful of microseconds of CPU and keeps millis whole.
+//
+// Belt and braces on top of that: the read path itself checks for a pending
+// overflow event and folds it in before answering (timer_hal.cpp:143,185),
+// so a single overflow that had not been serviced yet is still counted.
+//
+// None of this holds for HIBERNATE, which reboots instead of resuming; that
+// path is unavailable on this carrier board anyway, see sleepForNextCycle().
+//
+// The mark is deliberately NOT retained: millis() restarts at zero on a
+// reset, so a retained mark would make the next delta enormous. Starting it
+// at zero instead means a reset drops only the time since the last accrual,
+// which is why packElapsedAccrue() runs once per wake rather than once per
+// report - a reset then costs one wake interval, not one telemetry period.
+static retained uint64_t g_packElapsedMs = 0;
+static uint64_t s_packElapsedMark = 0;
+
+// Folds the time since the last call into g_packElapsedMs. Cheap and
+// idempotent, so it can be called from anywhere that is about to read the
+// counter, and is called once per wake so a reset drops as little as
+// possible.
+static void packElapsedAccrue(uint64_t now) {
+  // Guard against an unsigned underflow that should not be reachable, kept
+  // because the cost of being wrong is unbounded and permanent. Both sides
+  // are uint64_t, so a `now` behind the mark would not go negative - it would
+  // wrap to ~1.8e19 ms, land in the accumulator, and peg the estimate at the
+  // 38% floor for good: the accumulator is retained, so a reset won't clear
+  // it and only a battery swap will. Against that, one comparison.
+  //
+  // Nothing here can actually produce it. 64-bit milliseconds don't wrap for
+  // 584 million years (the 32-bit millis() this doesn't use would, in 49
+  // days), a reset leaves the mark at 0 with `now` above it, and Device OS
+  // keeps millis monotonic across the RTC2 overflow handling above. No else
+  // branch on purpose: if it ever did happen the right move is to resync to
+  // the new timebase - which the unconditional store below does - and drop
+  // the one interval, not to try to reconstruct it.
+  if (now > s_packElapsedMark) {
+    g_packElapsedMs += now - s_packElapsedMark;
+  }
+  s_packElapsedMark = now;
+}
 
 enum ModemPhase {
   MODEM_OFF = 0,
@@ -1091,11 +1179,19 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   // thread's queue, so networkStatusHandler() can't land in the middle and
   // no locking is needed - keep it that way if anything is inserted here.
   modemTimeAccrue(System.millis());
+  packElapsedAccrue(System.millis());
   uint32_t modemSearchSec = (uint32_t)(g_modemSearchMs / 1000);
   uint32_t modemReadySec = (uint32_t)(g_modemReadyMs / 1000);
   uint32_t modemOffgoingSec = (uint32_t)(g_modemOffgoingMs / 1000);
-  int batteryPercentage = batteryPercentEstimate(
-      vBatLoad, g_modemSearchMs, g_modemReadyMs, g_modemOffgoingMs);
+  // Wall-clock on this pack. Published alongside the modem timers because it
+  // is the other half of the same budget: subtract the three above from it
+  // and what is left is time the board spent asleep or idling between wakes,
+  // which is what the idle term in batteryPercentEstimate() is charged for.
+  // Seconds in 32 bits covers longer than any pack will last.
+  uint32_t packElapsedSec = (uint32_t)(g_packElapsedMs / 1000);
+  int batteryPercentage =
+      batteryPercentEstimate(vBatLoad, g_modemSearchMs, g_modemReadyMs,
+                             g_modemOffgoingMs, g_packElapsedMs);
   String payload = String::format(
       "{"
       "\"reedclosed\":%d,"
@@ -1109,11 +1205,13 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
       "\"modemSearchSec\":%u,"
       "\"modemReadySec\":%u,"
       "\"modemOffgoingSec\":%u,"
+      "\"packElapsedSec\":%u,"
       "\"slotOffsetSec\":%u"
       "}",
       reedClosed ? 1 : 0, batteryPercentage, vBatLoad, vBatIdle, signalStrength,
       signalQuality, g_cloudConnectAttemptsCount, g_cloudConnectSuccesses,
-      modemSearchSec, modemReadySec, modemOffgoingSec, telemetrySlotOffsetS());
+      modemSearchSec, modemReadySec, modemOffgoingSec, packElapsedSec,
+      telemetrySlotOffsetS());
   particle::Future<bool> result =
       Particle.publish("telemetry", payload, PRIVATE);
   return waitForPublish(result, "telemetry", payload.c_str());
@@ -1736,6 +1834,10 @@ static void sleepOrIdle() {
   pinMode(RGBG, INPUT);
   pinMode(RGBB, INPUT);
   sleepWithCellularOff();
+  // Once per wake, on the way out. Only the accumulator is retained, so
+  // whatever has not been folded in when a reset lands is lost - folding
+  // here bounds that at one wake interval instead of one report period.
+  packElapsedAccrue(System.millis());
 }
 
 // We only stay connected for a few seconds per wake (see loop()), which
