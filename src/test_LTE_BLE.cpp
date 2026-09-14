@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 37;
+const int FIRMWARE_VERSION = 38;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -185,6 +185,57 @@ const unsigned long MAX_CONNECT_WAIT_MS = 60 * 1000; // 60 seconds
 // somehow never reports complete/failed (e.g. the transfer stalls), we
 // still need to give up eventually instead of never sleeping again.
 const unsigned long MAX_OTA_WAIT_MS = 5UL * 60 * 1000; // 5 minutes
+
+// How long the board may go without reaching the top of loop() before the
+// hardware watchdog resets it.
+//
+// This exists for a failure that is real but, so far, unproven in its cause -
+// and the honest version of that is worth writing down, because the first
+// version of this comment overstated it.
+//
+// Three times a unit has gone silent straight after an ordinary report: 021 on
+// 2026-09-08 at 5.407V, 010 on 09-10 at 5.769V and again on 09-11. Each time
+// the last diagnostics were clean - panic code 0, zero disconnects, zero CoAP
+// retransmits, an uptime with no reset in it.
+//
+// The third one is now explained, and it was NOT a hang. Its reset happened to
+// be a pin_reset, which leaves retained SRAM alone, so the counters could be
+// read straight through the silence: 181 connect attempts and 10.8 hours of
+// search in 16 hours. The board was awake and working the whole time. A
+// watchdog would never have fired, because loop() never stopped running.
+//
+// The other two are still open, and open only because the evidence was
+// destroyed: both ended in a power-cut reset, which wipes retained, so there is
+// no way to tell whether those boards were hung or were doing the same thing
+// 010 turned out to be doing. So the case for a watchdog here is not "we have
+// seen hangs" - it is that a hang and a bad night of retries are
+// indistinguishable from the cloud, one of them is unrecoverable forever, and
+// the cost of covering it is one refresh per loop.
+//
+// It does not cover the failure we did identify. A board stuck retrying keeps
+// reaching loop() and keeps refreshing; what that needs is different, and
+// resetting it would actively hurt - System.reset() runs the NCP client's
+// init(), which zeroes waitReadyRetries_ and throws away the modem-recovery
+// ladder's progress (sara_ncp_client.cpp).
+//
+// nRF52840's WDT cannot be stopped once started and cannot be reconfigured, so
+// the timeout has to cover the longest stretch the firmware legitimately goes
+// without a refresh. That is a sleep chunk plus one wake's work: 60s of sleep,
+// up to MAX_CONNECT_WAIT_MS connecting, up to 25s waiting for the modem to
+// finish powering down, and the OTA hold - which does not count, because it
+// re-enters loop() on every pass and gets refreshed there. Ten minutes is an
+// order of magnitude over that, and still bounds a hang to well inside one
+// telemetry period.
+const unsigned long WATCHDOG_TIMEOUT_MS = 10UL * 60 * 1000; // 10 minutes
+
+// The watchdog counts wall-clock time, sleep included (see setup()), so a
+// sleep chunk longer than its timeout would reset the device on every single
+// cycle - a boot loop that only shows up in the field. WAKE_INTERVAL_MS is the
+// sleep chunk, not the report cadence, so raising the report cadence is safe
+// and raising this one is not.
+static_assert(WAKE_INTERVAL_MS < WATCHDOG_TIMEOUT_MS / 2,
+              "sleep chunk is too close to the watchdog timeout - the device "
+              "would reset itself every wake");
 
 // How long to keep the connection open after we're done publishing before
 // actually disconnecting. The cloud decides whether to push a pending OTA
@@ -1880,6 +1931,29 @@ void setup() {
   // and takes it back off (see REED_PIN).
   pinMode(REED_PIN, INPUT);
 
+  // Last line of defence against a hang, started before anything that could
+  // hang. Device OS does not refresh this for us - the only call in the tree
+  // is commented out (hal/src/nRF52840/delay_hal.cpp) - so it measures the
+  // application, which is the point.
+  //
+  // SLEEP_RUNNING deliberately on. Without it the nRF52840 WDT is configured
+  // PAUSE_SLEEP_HALT and stops counting whenever the core enters WFI, which is
+  // most of a cycle here and all of System.sleep(). That would still catch a
+  // spin like the one in sleepWithCellularOff(), but not a thread parked
+  // forever on a semaphore, and not a sleep that never ends - and "went to
+  // sleep, never came back" is the failure this is for.
+  //
+  // NOTIFY is not requested. It fires a callback before the reset, which is
+  // tempting for recording why, but the callback runs from an interrupt on a
+  // machine that has already proved it is stuck; Particle.publish() from there
+  // would hang instead of reporting. System.resetReason() after the reboot
+  // says RESET_REASON_WATCHDOG on the next boot report, which is the same
+  // information collected from a machine that is running again.
+  Watchdog.init(WatchdogConfiguration()
+                    .timeout(WATCHDOG_TIMEOUT_MS)
+                    .capabilities(WatchdogCap::SLEEP_RUNNING));
+  Watchdog.start();
+
   // No BLE antenna on this board - keep the radio fully off.
   BLE.off();
 
@@ -1948,6 +2022,12 @@ void loop() {
   // lost (see enqueueReedTransition()/drainReedQueue()).
   static bool lastReedState = readReedIsClosed();
   static float vBatIdle = 0.;
+  // One refresh per pass, at the top, before any of the work that could hang.
+  // Everything long-running below re-enters loop() rather than blocking inside
+  // itself - the OTA hold, the post-report linger, the connect retry gate -
+  // so this single call covers all of them, and anything that stops coming
+  // back here is exactly what should trip the reset.
+  Watchdog.refresh();
   bool reedState = readReedIsClosed();
   // Relight the LED with the fresh reading every pass - covers both waking
   // from sleep (sleepOrIdle() turned it off) and a flip mid-session.
@@ -2047,9 +2127,18 @@ void loop() {
   if (Particle.connected()) {
     if (!firmwareInfoPublished) {
       firmwareInfoPublished = true;
+      // resetReason rides along so a watchdog reset is legible in the event
+      // stream from our own side, next to the version that caused it. Device
+      // OS publishes spark/device/last_reset too, but that arrives on its own
+      // schedule and says nothing about which build was running. 60 is
+      // RESET_REASON_WATCHDOG; 20 pin, 40 power management, 140 user.
       Particle.publish("firmware_info",
-                       String::format("{\"version\":%d,\"commit\":\"%s\"}",
-                                      FIRMWARE_VERSION, GIT_COMMIT_SHA),
+                       String::format(
+                           "{\"version\":%d,\"commit\":\"%s\","
+                           "\"resetReason\":%d,\"resetData\":%lu}",
+                           FIRMWARE_VERSION, GIT_COMMIT_SHA,
+                           (int)System.resetReason(),
+                           (unsigned long)System.resetReasonData()),
                        PRIVATE);
     }
     // Deliver every queued reed transition, oldest first - stops (and
