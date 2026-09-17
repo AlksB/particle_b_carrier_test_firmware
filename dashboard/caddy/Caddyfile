@@ -1,0 +1,7 @@
+# HTTPS in front of Grafana. Caddy gets and renews the Let's Encrypt
+# certificate on its own; the only input is DOMAIN in .env, and an A record
+# for it pointing at this server.
+{$DOMAIN} {
+    encode gzip
+    reverse_proxy grafana:3000
+}

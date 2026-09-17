@@ -5,6 +5,11 @@
 #   docker compose run --rm ingest /data/particle_events.log   # load history, once
 #   open http://localhost:3000  # admin / $GRAFANA_ADMIN_PASSWORD
 #
+# On a server, set DOMAIN in .env, point DNS at the box and add the https
+# profile: Caddy terminates TLS on 80/443 and Grafana stays on localhost.
+#
+#   docker compose --profile https up -d --build
+#
 # `ingest` reads the live product event stream from api.particle.io and
 # reconnects on its own. History from the SSE log is loaded with the `run`
 # line above; inserts are idempotent, so the overlap between the log's end
@@ -54,8 +59,12 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      # Docker punches its own holes in iptables, bypassing ufw: anything
+      # published on 0.0.0.0 is reachable from the internet no matter what
+      # the host firewall says. Behind Caddy, bind to loopback only.
+      - "${GRAFANA_BIND:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
     environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
@@ -67,6 +76,21 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro,z
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro,z
 
+  caddy:
+    profiles: ["https"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [grafana]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env for the https profile}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
+      - caddy-data:/data
+
 volumes:
   pgdata:
   grafana-data:
+  caddy-data:

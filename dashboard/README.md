@@ -30,6 +30,53 @@ the stream's start is harmless, and so is loading the same file twice.
 Nothing replays what happened while neither was running: the SSE API has
 no history, so a gap in the stream is a gap in the data.
 
+## Deploying on a server
+
+Sized for 2 000 devices at a report every 6 h: 2 vCPU / 4 GB / 40 GB is
+plenty (Hetzner CX22 or similar), Debian 12.
+
+```sh
+# 1. box: firewall, docker, a non-root user
+apt update && apt install -y ufw git unattended-upgrades
+ufw allow OpenSSH && ufw allow 80 && ufw allow 443 && ufw enable
+curl -fsSL https://get.docker.com | sh
+adduser fleet && usermod -aG docker fleet
+# then: PasswordAuthentication no in /etc/ssh/sshd_config, key in ~fleet/.ssh
+
+# 2. code + secrets (as the fleet user)
+git clone <repo> /opt/fleet && cd /opt/fleet/dashboard
+cp .env.example .env
+openssl rand -base64 24   # x3, for the three passwords
+```
+
+In `.env`: the three passwords, `PARTICLE_TOKEN` (make a separate token
+for the server with `particle token create` so it can be revoked on its
+own), `DOMAIN`, `GRAFANA_ROOT_URL=https://$DOMAIN`, `GRAFANA_BIND=127.0.0.1`.
+Point an A record for the domain at the server, then:
+
+```sh
+# 3. up, with HTTPS
+docker compose --profile https up -d --build
+docker compose logs -f ingest          # "connected to ..." then commits
+
+# 4. history, once: copy the old log over and load it
+scp particle_events.log fleet@server:/opt/fleet/
+docker compose run --rm ingest /data/particle_events.log
+
+# 5. nightly backup (crontab -e)
+0 3 * * * cd /opt/fleet/dashboard && ./scripts/backup.sh >> backups/backup.log 2>&1
+```
+
+Firewall note: Docker publishes ports with its own iptables rules that
+bypass ufw, which is why Grafana is bound to 127.0.0.1 behind Caddy and
+Postgres is not published at all. Only Caddy's 80/443 face the internet.
+
+Keeping it running: `restart: unless-stopped` plus Docker starting on boot
+covers reboots. The one thing to alert on is the "Log freshness" tile
+(time since the newest event) - if it passes ~8 h the stream or the ingest
+is dead. Updates: `docker compose pull && docker compose --profile https up
+-d` now and then; `unattended-upgrades` handles the OS.
+
 ## The ingest without Docker
 
 ```sh
