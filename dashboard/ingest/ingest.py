@@ -1,35 +1,38 @@
 #!/usr/bin/env python3
 """
-Loads the SSE event log written by scripts/particle_event_log.sh into Postgres.
+Feeds the Particle product event stream into Postgres - live from the API,
+or from the SSE log written by scripts/particle_event_log.sh.
 
-The log is the raw Particle event stream: `event: <name>` / `data: <json>` line
-pairs, plus the `:ok` keepalives and the `[...] --- connecting ---` markers the
-shell script adds. The JSON envelope carries coreid, published_at and the
-product firmware version; the payload the firmware published is a *string*
-inside its `data` field, so every event type gets parsed twice and lands in
-its own table (see postgres/init/01_schema.sql).
+Both are the same format: `event: <name>` / `data: <json>` line pairs, with
+`:ok` keepalives every few seconds. The JSON envelope carries coreid,
+published_at and the product firmware version; the payload the firmware
+published is a *string* inside its `data` field, so every event type gets
+parsed twice and lands in its own table (see postgres/init/01_schema.sql).
 
-Every insert is ON CONFLICT DO NOTHING on (device_id, ts), so the same log
-can be fed in as many times as you like - which is what makes --follow safe
-to restart: it always re-reads the file from the top and only the new tail
-actually inserts.
+Every insert is ON CONFLICT DO NOTHING on (device_id, ts), so the same
+events can be fed in as many times as you like: load the historical log
+once, then run --stream, and a restart or an overlap never duplicates.
 
 Usage:
-  ingest.py particle_events.log                 # one-off load
-  ingest.py particle_events.log --follow        # load, then tail forever
+  ingest.py --stream                            # live from api.particle.io, reconnects forever
+  ingest.py particle_events.log                 # one-off load of a log file
+  ingest.py particle_events.log --follow        # load, then tail the file
   ingest.py particle_events.log --dry-run       # parse only, print counts
-  cat log | ingest.py -                         # from stdin
-  curl -sN .../events | ingest.py -             # straight from the SSE stream, no file
+  curl -sN .../events | ingest.py -             # from stdin (a curl stream, a zcat of an archive)
 
 Connection: $DATABASE_URL (postgresql://user:pw@host:5432/db)
+Stream:     $PARTICLE_TOKEN, $PARTICLE_PRODUCT_ID (default 44896)
 """
 
 import argparse
 import json
 import os
 import re
+import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
@@ -38,26 +41,14 @@ HOOK_RESPONSE = re.compile(r"^([0-9a-f]{24})/hook-response/(.+)/\d+$")
 HOOK_SENT = re.compile(r"^hook-sent/(.+)$")
 HOOK_ERROR = re.compile(r"^hook-error/(.+)/\d+$")
 
+PRODUCT_ID = os.environ.get("PARTICLE_PRODUCT_ID", "44896")
+API = "https://api.particle.io"
+
 BATCH = 2000        # rows per transaction when loading a backlog
 FLUSH_SEC = 2       # max age of an unflushed batch when streaming
 
 
 # ------------------------------------------------------------------ parsing
-
-def sse_records(lines):
-    """Yields (event_name, envelope_dict) pairs from the raw log lines."""
-    name = None
-    for line in lines:
-        if line.startswith("event: "):
-            name = line[7:].strip()
-        elif line.startswith("data: ") and name:
-            try:
-                yield name, json.loads(line[6:])
-            except json.JSONDecodeError:
-                pass
-            name = None
-        # everything else: ':ok', '[ts] --- connecting ---', blank
-
 
 def ts_of(env):
     # published_at is ISO-8601 with a Z suffix and millisecond precision
@@ -241,10 +232,13 @@ on conflict (device_id) do update set
 
 
 class Loader:
-    def __init__(self, conn, dry_run=False, keep_raw=False):
+    def __init__(self, conn, dry_run=False, keep_raw=False, verbose=False):
         self.conn = conn
         self.dry_run = dry_run
         self.keep_raw = keep_raw
+        self.verbose = verbose          # log every commit; for the long-running modes
+        self.n_rows = 0                 # since the last flush
+        self.n_skipped = 0
         self.pending = defaultdict(list)
         self.devices = {}          # device_id -> [fw, app_hash, last_reset, last_seen, first_seen]
         self.counts = Counter()
@@ -254,10 +248,12 @@ class Loader:
         r = route(name, env, self.keep_raw)
         if r is None:
             self.counts["(skipped) " + name] += 1
+            self.n_skipped += 1
             return
         table, row = r
         self.pending[table].append(row)
         self.counts[table] += 1
+        self.n_rows += 1
 
         dev = env.get("coreid", "")
         if DEVICE_ID.match(dev):
@@ -280,19 +276,26 @@ class Loader:
                 or time.time() - self.last_flush > FLUSH_SEC):
             self.flush()
 
+    def flush_if_stale(self):
+        """Called on keepalives and idle ticks, so the tail of a burst does
+        not wait for the next event to be committed."""
+        if (self.pending or self.n_skipped) and time.time() - self.last_flush > FLUSH_SEC:
+            self.flush()
+
     def flush(self):
-        if self.dry_run:
-            self.pending.clear()
-            self.last_flush = time.time()
-            return
-        with self.conn.cursor() as cur:
-            for table, rows in self.pending.items():
-                cur.executemany(INSERT[table], rows)
-            if self.devices:
-                cur.executemany(DEVICE_UPSERT, [(k, *v) for k, v in self.devices.items()])
-        self.conn.commit()
+        if not self.dry_run and self.pending:
+            with self.conn.cursor() as cur:
+                for table, rows in self.pending.items():
+                    cur.executemany(INSERT[table], rows)
+                if self.devices:
+                    cur.executemany(DEVICE_UPSERT, [(k, *v) for k, v in self.devices.items()])
+            self.conn.commit()
+        if self.verbose and (self.n_rows or self.n_skipped):
+            tables = ", ".join(f"{len(v)} {k}" for k, v in self.pending.items())
+            log(f"+{self.n_rows} rows ({tables}), {self.n_skipped} skipped")
         self.pending.clear()
         self.devices.clear()
+        self.n_rows = self.n_skipped = 0
         self.last_flush = time.time()
 
 
@@ -330,9 +333,62 @@ def follow(path, poll_sec):
                     break  # truncated in place (copytruncate): start over
 
 
+def sse_stream(token, product_id, retry_sec=5, timeout_sec=60):
+    """Yields lines from the product event stream, reconnecting whenever it
+    drops. Particle sends `:ok` every ~9 s, so a 60 s read timeout catches a
+    silently dead connection. Yields None between connections so the caller
+    can flush."""
+    url = f"{API}/v1/products/{product_id}/events"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
+                                               "Accept": "text/event-stream"})
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                log(f"connected to {url}")
+                for raw in resp:
+                    yield raw.decode("utf-8", errors="replace")
+            log("stream ended")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                sys.exit(f"error: {e.code} from Particle - bad or expired PARTICLE_TOKEN")
+            log(f"stream error: {e}")
+        except (urllib.error.URLError, OSError) as e:
+            log(f"stream dropped: {e}")
+        yield None
+        time.sleep(retry_sec)
+
+
+def consume(loader, lines):
+    """Runs SSE lines through the loader. None is an idle marker (no data
+    right now); any other non event/data line - the `:ok` keepalive, the
+    shell script's connect markers - is a tick for the stale-batch flush."""
+    name = None
+    for line in lines:
+        if line is None:
+            loader.flush()
+            continue
+        if line.startswith("event: "):
+            name = line[7:].strip()
+        elif line.startswith("data: ") and name:
+            try:
+                loader.feed(name, json.loads(line[6:]))
+            except json.JSONDecodeError:
+                pass
+            name = None
+        else:
+            loader.flush_if_stale()
+    loader.flush()
+
+
+def log(msg):
+    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("logfile", help="event log path, or - for stdin")
+    ap.add_argument("logfile", nargs="?", help="event log path, or - for stdin")
+    ap.add_argument("--stream", action="store_true",
+                    help="read the live product event stream from api.particle.io instead of a file")
     ap.add_argument("--follow", action="store_true", help="keep tailing the file after loading it")
     ap.add_argument("--poll", type=float, default=2.0, help="seconds between tail polls (default 2)")
     ap.add_argument("--dry-run", action="store_true", help="parse only, no database")
@@ -341,6 +397,8 @@ def main():
     ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL"),
                     help="postgresql://user:pw@host/db (default $DATABASE_URL)")
     args = ap.parse_args()
+    if bool(args.stream) == bool(args.logfile):
+        ap.error("give either a logfile or --stream")
 
     conn = None
     if not args.dry_run:
@@ -349,41 +407,41 @@ def main():
         import psycopg
         conn = psycopg.connect(args.database_url)
 
-    loader = Loader(conn, dry_run=args.dry_run, keep_raw=args.keep_raw)
+    loader = Loader(conn, dry_run=args.dry_run, keep_raw=args.keep_raw,
+                    verbose=args.stream or args.follow)
     t0 = time.time()
 
-    def load_lines(lines):
-        for name, env in sse_records(lines):
-            loader.feed(name, env)
+    # PID 1 in a container gets no default SIGTERM disposition, so without
+    # this `docker stop` waits out its grace period and SIGKILLs us mid-batch
+    def stop(signum, frame):
         loader.flush()
+        log("stopped")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
 
-    if args.logfile == "-":
-        load_lines(sys.stdin)
+    if args.stream:
+        token = os.environ.get("PARTICLE_TOKEN")
+        if not token:
+            sys.exit("error: set PARTICLE_TOKEN")
+        consume(loader, sse_stream(token, PRODUCT_ID))
+    elif args.logfile == "-":
+        consume(loader, sys.stdin)
     elif args.follow:
-        name = None
-        loaded_once = False
-        for line in follow(args.logfile, args.poll):
-            if line is None:
-                loader.flush()
-                if not loaded_once:
+        def lines():
+            loaded_once = False
+            for line in follow(args.logfile, args.poll):
+                if line is None and not loaded_once:
                     loaded_once = True
+                    loader.flush()
                     report(loader, t0)
-                    print("following...", flush=True)
-                continue
-            if line.startswith("event: "):
-                name = line[7:].strip()
-            elif line.startswith("data: ") and name:
-                try:
-                    loader.feed(name, json.loads(line[6:]))
-                except json.JSONDecodeError:
-                    pass
-                name = None
-        return
+                    log("following...")
+                yield line
+        consume(loader, lines())
     else:
         with open(args.logfile, errors="replace") as f:
-            load_lines(f)
-
-    report(loader, t0)
+            consume(loader, f)
+        report(loader, t0)
 
 
 def report(loader, t0):

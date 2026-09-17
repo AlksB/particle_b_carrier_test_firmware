@@ -1,15 +1,16 @@
-# Fleet dashboard: Postgres + Grafana + the log ingest.
+# Fleet dashboard: Postgres + Grafana + the event ingest.
 #
-#   cp .env.example .env        # set passwords and the path to the event log
-#   docker compose up -d        # postgres, ingest (tails the log), grafana
+#   cp .env.example .env        # passwords, PARTICLE_TOKEN, path to the old log
+#   docker compose up -d --build
+#   docker compose run --rm ingest /data/particle_events.log   # load history, once
 #   open http://localhost:3000  # admin / $GRAFANA_ADMIN_PASSWORD
 #
-# The ingest re-reads the whole log on every start and only inserts what is
-# new, so restarting anything is safe. The :z on bind mounts is for SELinux
-# hosts (Fedora/RHEL, podman); Docker elsewhere accepts and ignores it. To also run the SSE stream that writes
-# the log (scripts/particle_event_log.sh) in a container:
-#
-#   PARTICLE_TOKEN=... docker compose --profile stream up -d
+# `ingest` reads the live product event stream from api.particle.io and
+# reconnects on its own. History from the SSE log is loaded with the `run`
+# line above; inserts are idempotent, so the overlap between the log's end
+# and the stream's start does not duplicate anything, and re-running the
+# load is harmless. The :z on bind mounts is for SELinux hosts (Fedora/RHEL,
+# podman); Docker elsewhere accepts and ignores it.
 
 services:
   postgres:
@@ -39,9 +40,12 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-fleet}:${POSTGRES_PASSWORD}@postgres:5432/fleet
+      PARTICLE_TOKEN: ${PARTICLE_TOKEN:?set in .env}
+      PARTICLE_PRODUCT_ID: ${PARTICLE_PRODUCT_ID:-44896}
     volumes:
-      - ${EVENT_LOG_DIR:?set in .env}:/data:z
-    command: ["/data/${EVENT_LOG_FILE:-particle_events.log}", "--follow"]
+      # old logs to backfill from, see the `run` line at the top
+      - ${EVENT_LOG_DIR:-..}:/data:ro,z
+    command: ["--stream"]
 
   grafana:
     image: grafana/grafana-oss:12.1.0
@@ -62,19 +66,6 @@ services:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro,z
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro,z
-
-  # Optional: the SSE stream itself, writing the same log file the ingest
-  # tails. Use this instead of running particle_event_log.sh on the host.
-  stream:
-    profiles: ["stream"]
-    image: alpine:3.20
-    restart: unless-stopped
-    environment:
-      PARTICLE_TOKEN: ${PARTICLE_TOKEN:-}   # the script refuses to start without it
-    volumes:
-      - ${EVENT_LOG_DIR}:/data:z
-      - ../scripts/particle_event_log.sh:/particle_event_log.sh:ro,z
-    command: sh -c "apk add --no-cache bash curl grep >/dev/null && exec bash /particle_event_log.sh /data/${EVENT_LOG_FILE:-particle_events.log}"
 
 volumes:
   pgdata:

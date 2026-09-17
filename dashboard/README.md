@@ -1,42 +1,50 @@
 # Fleet dashboard
 
-Grafana over Postgres, fed by the SSE event log that
-`scripts/particle_event_log.sh` writes.
+Grafana over Postgres, fed live from the Particle product event stream.
 
 ```
-particle_event_log.sh ──► particle_events.log ──► ingest (--follow) ──► Postgres ──► Grafana
+api.particle.io (SSE) ──► ingest --stream ──► Postgres ──► Grafana
+particle_events.log   ──► ingest <file>  ──┘   (history, once)
 ```
 
 ## Run
 
 ```sh
 cd dashboard
-cp .env.example .env      # passwords + where the log file lives
+cp .env.example .env      # passwords, PARTICLE_TOKEN, where the old log lives
 docker compose up -d --build
+docker compose run --rm ingest /data/particle_events.log    # backfill history
 ```
 
 Grafana: http://localhost:3000, user `admin`, password from `.env`. The
 **Fleet** dashboard is provisioned and opens on the last 7 days.
 
-`ingest` loads the whole log on start and then tails it, so as long as
-`particle_event_log.sh` keeps appending on the host the dashboard is live.
-To run the stream in a container instead of on the host:
+`ingest` holds an SSE connection to `api.particle.io` and reconnects when
+it drops (a dead connection is noticed within 60 s - Particle keepalives
+come every ~9 s). Events are committed within two seconds of arriving.
+`docker compose logs -f ingest` shows connects and drops.
 
-```sh
-PARTICLE_TOKEN=... docker compose --profile stream up -d
-```
+The backfill and the stream write the same tables with `on conflict do
+nothing` on `(device_id, ts)`, so the overlap between the log's tail and
+the stream's start is harmless, and so is loading the same file twice.
+Nothing replays what happened while neither was running: the SSE API has
+no history, so a gap in the stream is a gap in the data.
 
-## Load a log by hand / without Docker
+## The ingest without Docker
 
 ```sh
 pip install 'psycopg[binary]'
-DATABASE_URL=postgresql://fleet:pw@localhost:5432/fleet \
-    python3 ingest/ingest.py ../particle_events.log            # once
+export DATABASE_URL=postgresql://fleet:pw@localhost:5432/fleet
+PARTICLE_TOKEN=... python3 ingest/ingest.py --stream           # live
+python3 ingest/ingest.py ../particle_events.log                # a log file, once
+python3 ingest/ingest.py ../particle_events.log --follow       # a log file someone keeps appending to
 python3 ingest/ingest.py ../particle_events.log --dry-run      # just count
+curl -sN -H "Authorization: Bearer $PARTICLE_TOKEN" \
+     https://api.particle.io/v1/products/44896/events | python3 ingest/ingest.py -
 ```
 
-Inserts are `on conflict do nothing` keyed on `(device_id, ts)`, so feeding
-the same log twice (or an archived rotation) is harmless.
+The last form is what `--stream` does internally, minus the reconnect
+loop; useful with `tee -a` if you also want a raw log on disk.
 
 ## What ends up where
 
