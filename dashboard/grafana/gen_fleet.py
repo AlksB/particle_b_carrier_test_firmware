@@ -64,6 +64,8 @@ TF = "$__timeFilter(ts)"
 # every per-device series is labelled with the Particle device name, falling
 # back to the id (device_label view); the $device variable filters on ids
 LBL = "join device_label using (device_id)"
+DEVICE_VAR_SQL = ("select case when name is null then device_id else name || '  ·  ' || device_id end as __text, "
+                  "device_id as __value from device order by name nulls last, device_id")
 panels = []
 y = 0
 
@@ -231,8 +233,8 @@ dash = {
     "version": 1,
     "templating": {"list": [
         {"name": "device", "label": "Device", "type": "query", "datasource": DS,
-         "query": "select label as __text, device_id as __value from device_label order by 1",
-         "definition": "select label as __text, device_id as __value from device_label order by 1",
+         # the picker filters on __text, so both name and id are in it and either can be typed
+         "query": DEVICE_VAR_SQL, "definition": DEVICE_VAR_SQL,
          "multi": True, "includeAll": True, "allValue": None, "refresh": 1, "sort": 1,
          "current": {"selected": True, "text": ["All"], "value": ["$__all"]}}
     ]},

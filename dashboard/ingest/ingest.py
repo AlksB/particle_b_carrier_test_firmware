@@ -350,9 +350,13 @@ SCHEMA_SQL = os.environ.get("SCHEMA_SQL") or os.path.join(
 
 
 def migrate(conn):
+    import psycopg.errors
+    for sql in MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except psycopg.errors.UndefinedTable:
+            conn.rollback()  # empty database: the schema file creates it whole
     with conn.cursor() as cur:
-        for sql in MIGRATIONS:
-            cur.execute(sql)
         try:
             with open(SCHEMA_SQL) as f:
                 cur.execute(f.read())

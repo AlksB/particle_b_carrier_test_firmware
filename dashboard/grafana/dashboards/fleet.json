@@ -24,8 +24,8 @@
      "type": "grafana-postgresql-datasource",
      "uid": "fleet-pg"
     },
-    "query": "select label as __text, device_id as __value from device_label order by 1",
-    "definition": "select label as __text, device_id as __value from device_label order by 1",
+    "query": "select case when name is null then device_id else name || '  ·  ' || device_id end as __text, device_id as __value from device order by name nulls last, device_id",
+    "definition": "select case when name is null then device_id else name || '  ·  ' || device_id end as __text, device_id as __value from device order by name nulls last, device_id",
     "multi": true,
     "includeAll": true,
     "allValue": null,
