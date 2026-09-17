@@ -19,6 +19,7 @@ Usage:
   ingest.py particle_events.log --follow        # load, then tail forever
   ingest.py particle_events.log --dry-run       # parse only, print counts
   cat log | ingest.py -                         # from stdin
+  curl -sN .../events | ingest.py -             # straight from the SSE stream, no file
 
 Connection: $DATABASE_URL (postgresql://user:pw@host:5432/db)
 """
@@ -37,7 +38,8 @@ HOOK_RESPONSE = re.compile(r"^([0-9a-f]{24})/hook-response/(.+)/\d+$")
 HOOK_SENT = re.compile(r"^hook-sent/(.+)$")
 HOOK_ERROR = re.compile(r"^hook-error/(.+)/\d+$")
 
-BATCH = 2000
+BATCH = 2000        # rows per transaction when loading a backlog
+FLUSH_SEC = 2       # max age of an unflushed batch when streaming
 
 
 # ------------------------------------------------------------------ parsing
@@ -246,7 +248,7 @@ class Loader:
         self.pending = defaultdict(list)
         self.devices = {}          # device_id -> [fw, app_hash, last_reset, last_seen, first_seen]
         self.counts = Counter()
-        self.n_lines = 0
+        self.last_flush = time.time()
 
     def feed(self, name, env):
         r = route(name, env, self.keep_raw)
@@ -272,12 +274,16 @@ class Loader:
                     d[2] = env.get("data")
             d[4] = min(d[4], ts)
 
-        if sum(len(v) for v in self.pending.values()) >= BATCH:
+        # batch by size, but also by age so a slow stream (stdin from a
+        # live curl) does not sit on rows for minutes waiting for a full batch
+        if (sum(len(v) for v in self.pending.values()) >= BATCH
+                or time.time() - self.last_flush > FLUSH_SEC):
             self.flush()
 
     def flush(self):
         if self.dry_run:
             self.pending.clear()
+            self.last_flush = time.time()
             return
         with self.conn.cursor() as cur:
             for table, rows in self.pending.items():
@@ -287,6 +293,7 @@ class Loader:
         self.conn.commit()
         self.pending.clear()
         self.devices.clear()
+        self.last_flush = time.time()
 
 
 def follow(path, poll_sec):
@@ -313,8 +320,14 @@ def follow(path, poll_sec):
                     st = os.stat(path)
                 except FileNotFoundError:
                     break
-                if st.st_ino != ino or st.st_size < pos:
-                    break  # rotated or truncated: reopen from the top
+                if st.st_ino != ino:
+                    # rotated: drain what was appended to the old file
+                    # during the sleep, then reopen the new one from the top
+                    for line in f:
+                        yield line
+                    break
+                if st.st_size < pos:
+                    break  # truncated in place (copytruncate): start over
 
 
 def main():
