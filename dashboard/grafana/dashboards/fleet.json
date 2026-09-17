@@ -1094,7 +1094,7 @@
      },
      "refId": "A",
      "rawQuery": true,
-     "rawSql": "select ts, label as device, search_sec, age_sec,\n       substring(raw from '\\+CEER: ([^|]*)') as ceer,\n       substring(raw from '\\+CGATT: ([0-9])') as cgatt,\n       substring(raw from '\\+COPS: ([^|]*)') as cops,\n       raw\nfrom connect_failure join device_label using (device_id) where $__timeFilter(ts) and device_id in ($device) order by ts desc limit 200",
+     "rawSql": "select ts, label as device, search_sec, age_sec, ceer, cgatt, cops,\n       band, dl_mhz, tac, cell_id, pci, rsrp_dbm, sinr, raw\nfrom connect_failures join device_label using (device_id) where $__timeFilter(ts) and device_id in ($device) order by ts desc limit 200",
      "format": "table",
      "editorMode": "code"
     }
@@ -1121,6 +1121,34 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "rsrp_dbm"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dBm"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "dl_mhz"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "MHz"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "raw"
       },
       "properties": [
@@ -1133,12 +1161,12 @@
     ]
    },
    "options": {},
-   "description": "AT dump captured when the connect budget ran out. CEER is the modem's reject cause; CGATT 0 = never attached."
+   "description": "AT dump captured when the connect budget ran out, taken apart: CEER is the modem's reject cause, CGATT 0 = never attached, and band/cell/RSRP are what it was camped on at that moment (empty = no cell at all)."
   },
   {
    "id": 16,
    "type": "row",
-   "title": "Power",
+   "title": "Radio",
    "collapsed": false,
    "gridPos": {
     "x": 0,
@@ -1150,6 +1178,662 @@
   },
   {
    "id": 17,
+   "type": "state-timeline",
+   "title": "Serving cell",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 51,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, label as device, tac || ' / ' || cell_id as cell from connections join device_label using (device_id)\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 70,
+      "lineWidth": 0
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "mergeValues": true,
+    "showValue": "auto",
+    "alignValue": "left",
+    "rowHeight": 0.8,
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    }
+   },
+   "transformations": [
+    {
+     "id": "partitionByValues",
+     "options": {
+      "fields": [
+       "device"
+      ],
+      "keepFields": false,
+      "naming": {
+       "asLabels": false
+      }
+     }
+    }
+   ],
+   "description": "TAC / E-UTRAN cell id the device attached through, per report. A colour change is a different cell; the same eNodeB with another sector differs only in the last two hex digits."
+  },
+  {
+   "id": 18,
+   "type": "state-timeline",
+   "title": "Band",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 51,
+    "w": 12,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, label as device, 'B' || band || ' · ' || dl_mhz || ' MHz' as band from connections join device_label using (device_id)\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 70,
+      "lineWidth": 0
+     },
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "mergeValues": true,
+    "showValue": "auto",
+    "alignValue": "left",
+    "rowHeight": 0.8,
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    }
+   },
+   "transformations": [
+    {
+     "id": "partitionByValues",
+     "options": {
+      "fields": [
+       "device"
+      ],
+      "keepFields": false,
+      "naming": {
+       "asLabels": false
+      }
+     }
+    }
+   ],
+   "description": "LTE band and downlink centre frequency (from the EARFCN) per report."
+  },
+  {
+   "id": 19,
+   "type": "table",
+   "title": "Cells seen",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 60,
+    "w": 24,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select tac, cell_id, enb, sector, pci, band, dl_mhz, bw_mhz, operator,\n       count(*) as connections,\n       count(distinct device_id) as devices,\n       string_agg(distinct label, ', ' order by label) as device_names,\n       round(avg(rsrp_dbm))::int as rsrp_dbm,\n       min(rsrp_dbm) as rsrp_min,\n       round(avg(sinr)::numeric, 1) as sinr,\n       max(ts) as last_seen\nfrom connections join device_label using (device_id)\nwhere $__timeFilter(ts) and device_id in ($device)\ngroup by 1, 2, 3, 4, 5, 6, 7, 8, 9 order by connections desc",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "rsrp_dbm"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dBm"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": -110
+          },
+          {
+           "color": "green",
+           "value": -100
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "sinr"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dB"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 0
+          },
+          {
+           "color": "green",
+           "value": 5
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "rsrq_db"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dB"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "dl_mhz"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "MHz"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "bw_mhz"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "MHz"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ts"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "last_seen"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "connections",
+      "desc": true
+     }
+    ]
+   },
+   "description": "Every cell the selected devices attached through in the time range, with how often and how well. rsrp_dbm/sinr are averages over those connections."
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "Connections per cell, per day",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 69,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select $__timeGroupAlias(ts, 1d), tac || '/' || cell_id as metric, count(*) from connections\nwhere $__timeFilter(ts) and device_id in ($device) group by 1, 2 order by 1",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "bars",
+      "fillOpacity": 70,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "How the selected devices' connections split across cells, day by day."
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "RSRP by band",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 69,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, 'B' || band as metric, rsrp_dbm from connections\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "dBm",
+     "custom": {
+      "drawStyle": "points",
+      "showPoints": "always",
+      "pointSize": 3
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "Every connection's RSRP, coloured by band. Shows whether the modem's band choice is costing signal."
+  },
+  {
+   "id": 22,
+   "type": "table",
+   "title": "Connections",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 77,
+    "w": 24,
+    "h": 10
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts, label as device, operator, band, dl_mhz, bw_mhz, tac, cell_id, enb, sector, pci,\n       rsrp_dbm, rsrq_db, sinr, os_rsrp_dbm\nfrom connections join device_label using (device_id)\nwhere $__timeFilter(ts) and device_id in ($device) order by ts desc limit 1000",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "rsrp_dbm"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dBm"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": -110
+          },
+          {
+           "color": "green",
+           "value": -100
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "sinr"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dB"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 0
+          },
+          {
+           "color": "green",
+           "value": 5
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "rsrq_db"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dB"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "dl_mhz"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "MHz"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "bw_mhz"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "MHz"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ts"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "last_seen"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "os_rsrp_dbm"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dBm"
+       },
+       {
+        "id": "displayName",
+        "value": "rsrp (OS)"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "ts",
+      "desc": true
+     }
+    ]
+   },
+   "description": "One row per report: serving cell and frequency from the modem's +UCGED, operator and the OS's own RSRP from the diagnostics of the same wake cycle. Newest 1000 in the range."
+  },
+  {
+   "id": 23,
+   "type": "row",
+   "title": "Power",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 87,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 24,
    "type": "timeseries",
    "title": "Battery",
    "datasource": {
@@ -1158,7 +1842,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 51,
+    "y": 88,
     "w": 12,
     "h": 8
    },
@@ -1204,7 +1888,7 @@
    }
   },
   {
-   "id": 18,
+   "id": 25,
    "type": "timeseries",
    "title": "Battery voltage (idle)",
    "datasource": {
@@ -1213,7 +1897,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 51,
+    "y": 88,
     "w": 12,
     "h": 8
    },
@@ -1258,20 +1942,20 @@
    }
   },
   {
-   "id": 19,
+   "id": 26,
    "type": "row",
    "title": "Backend",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 59,
+    "y": 96,
     "w": 24,
     "h": 1
    },
    "panels": []
   },
   {
-   "id": 20,
+   "id": 27,
    "type": "timeseries",
    "title": "Webhook errors per hour, by cause",
    "datasource": {
@@ -1280,7 +1964,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 60,
+    "y": 97,
     "w": 12,
     "h": 8
    },
@@ -1323,7 +2007,7 @@
    "description": "hook-error events grouped by the host (or Particle's own message) that produced them."
   },
   {
-   "id": 21,
+   "id": 28,
    "type": "timeseries",
    "title": "Webhook deliveries per hour",
    "datasource": {
@@ -1332,7 +2016,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 60,
+    "y": 97,
     "w": 12,
     "h": 8
    },
@@ -1376,7 +2060,7 @@
    "description": "For the telemetry hook: sent vs. response (delivered) vs. error. sent counts every configured integration, so it is a multiple of the telemetry rows."
   },
   {
-   "id": 22,
+   "id": 29,
    "type": "table",
    "title": "Firmware versions",
    "datasource": {
@@ -1385,7 +2069,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 68,
+    "y": 105,
     "w": 12,
     "h": 6
    },
@@ -1409,7 +2093,7 @@
    "options": {}
   },
   {
-   "id": 23,
+   "id": 30,
    "type": "table",
    "title": "Resets & flashes",
    "datasource": {
@@ -1418,7 +2102,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 68,
+    "y": 105,
     "w": 12,
     "h": 6
    },

@@ -34,6 +34,22 @@ def panel(type_, title, sql, x, y, w, h, fmt="time_series", unit=None, options=N
     if desc: p["description"] = desc
     return p
 
+def state_timeline(title, sql, x, y, w, h, desc=None, mappings=None):
+    """One lane per device (partitionByValues on the `device` column), the
+    `value` column drawn as coloured states. Strings without a mapping get
+    palette colours automatically."""
+    p = panel("state-timeline", title, sql, x, y, w, h, fmt="table",
+              field={"custom": {"fillOpacity": 70, "lineWidth": 0}, "color": {"mode": "palette-classic"}},
+              options={"mergeValues": True, "showValue": "auto", "alignValue": "left", "rowHeight": 0.8,
+                       "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True}},
+              transformations=[{"id": "partitionByValues",
+                                "options": {"fields": ["device"], "keepFields": False, "naming": {"asLabels": False}}}],
+              desc=desc)
+    if mappings:
+        p["fieldConfig"]["defaults"]["mappings"] = mappings
+    return p
+
+
 def row(title, y):
     return {"id": nid(), "type": "row", "title": title, "collapsed": False, "gridPos": {"x": 0, "y": y, "w": 24, "h": 1}, "panels": []}
 
@@ -169,17 +185,85 @@ where {TF} and {DEV} group by 1, 2 order by 1""", 12, y, draw="bars",
 ]
 y += 8
 panels.append(panel("table", "Recent connect failures", f"""
-select ts, label as device, search_sec, age_sec,
-       substring(raw from '\\+CEER: ([^|]*)') as ceer,
-       substring(raw from '\\+CGATT: ([0-9])') as cgatt,
-       substring(raw from '\\+COPS: ([^|]*)') as cops,
-       raw
-from connect_failure {LBL} where {TF} and {DEV} order by ts desc limit 200""", 0, y, 24, 8, fmt="table",
+select ts, label as device, search_sec, age_sec, ceer, cgatt, cops,
+       band, dl_mhz, tac, cell_id, pci, rsrp_dbm, sinr, raw
+from connect_failures {LBL} where {TF} and {DEV} order by ts desc limit 200""", 0, y, 24, 8, fmt="table",
     field={"custom": {"filterable": True}},
     overrides=[{"matcher": {"id": "byName", "options": "ts"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+               {"matcher": {"id": "byName", "options": "rsrp_dbm"}, "properties": [{"id": "unit", "value": "dBm"}]},
+               {"matcher": {"id": "byName", "options": "dl_mhz"}, "properties": [{"id": "unit", "value": "MHz"}, {"id": "decimals", "value": 1}]},
                {"matcher": {"id": "byName", "options": "raw"}, "properties": [{"id": "custom.width", "value": 600}]}],
-    desc="AT dump captured when the connect budget ran out. CEER is the modem's reject cause; CGATT 0 = never attached."))
+    desc="AT dump captured when the connect budget ran out, taken apart: CEER is the modem's reject cause, CGATT 0 = never attached, and band/cell/RSRP are what it was camped on at that moment (empty = no cell at all)."))
 y += 8
+
+# ------------------------------------------------------------------ radio
+panels.append(row("Radio", y)); y += 1
+panels += [
+    state_timeline("Serving cell", f"""
+select ts as time, label as device, tac || ' / ' || cell_id as cell from connections {LBL}
+where {TF} and {DEV} order by ts""", 0, y, 12, 9,
+        desc="TAC / E-UTRAN cell id the device attached through, per report. A colour change is a different cell; the same eNodeB with another sector differs only in the last two hex digits."),
+    state_timeline("Band", f"""
+select ts as time, label as device, 'B' || band || ' · ' || dl_mhz || ' MHz' as band from connections {LBL}
+where {TF} and {DEV} order by ts""", 12, y, 12, 9,
+        desc="LTE band and downlink centre frequency (from the EARFCN) per report."),
+]
+y += 9
+
+sig_overrides = [
+    {"matcher": {"id": "byName", "options": "rsrp_dbm"},
+     "properties": [{"id": "unit", "value": "dBm"}, {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+                    {"id": "thresholds", "value": thresholds((None, "red"), (-110, "orange"), (-100, "green"))["thresholds"]}]},
+    {"matcher": {"id": "byName", "options": "sinr"},
+     "properties": [{"id": "unit", "value": "dB"}, {"id": "decimals", "value": 1}, {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+                    {"id": "thresholds", "value": thresholds((None, "red"), (0, "orange"), (5, "green"))["thresholds"]}]},
+    {"matcher": {"id": "byName", "options": "rsrq_db"}, "properties": [{"id": "unit", "value": "dB"}, {"id": "decimals", "value": 1}]},
+    {"matcher": {"id": "byName", "options": "dl_mhz"}, "properties": [{"id": "unit", "value": "MHz"}, {"id": "decimals", "value": 1}]},
+    {"matcher": {"id": "byName", "options": "bw_mhz"}, "properties": [{"id": "unit", "value": "MHz"}]},
+    {"matcher": {"id": "byName", "options": "ts"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+    {"matcher": {"id": "byName", "options": "last_seen"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+]
+panels.append(panel("table", "Cells seen", f"""
+select tac, cell_id, enb, sector, pci, band, dl_mhz, bw_mhz, operator,
+       count(*) as connections,
+       count(distinct device_id) as devices,
+       string_agg(distinct label, ', ' order by label) as device_names,
+       round(avg(rsrp_dbm))::int as rsrp_dbm,
+       min(rsrp_dbm) as rsrp_min,
+       round(avg(sinr)::numeric, 1) as sinr,
+       max(ts) as last_seen
+from connections {LBL}
+where {TF} and {DEV}
+group by 1, 2, 3, 4, 5, 6, 7, 8, 9 order by connections desc""", 0, y, 24, 9, fmt="table",
+    field={"custom": {"filterable": True}}, overrides=sig_overrides,
+    options={"showHeader": True, "cellHeight": "sm", "sortBy": [{"displayName": "connections", "desc": True}]},
+    desc="Every cell the selected devices attached through in the time range, with how often and how well. rsrp_dbm/sinr are averages over those connections."))
+y += 9
+
+panels += [
+    ts("Connections per cell, per day", f"""
+select $__timeGroupAlias(ts, 1d), tac || '/' || cell_id as metric, count(*) from connections
+where {TF} and {DEV} group by 1, 2 order by 1""", 0, y, draw="bars",
+       field={"custom": {"drawStyle": "bars", "fillOpacity": 70, "stacking": {"mode": "normal"}}},
+       desc="How the selected devices' connections split across cells, day by day."),
+    ts("RSRP by band", f"""
+select ts as time, 'B' || band as metric, rsrp_dbm from connections
+where {TF} and {DEV} order by ts""", 12, y, unit="dBm", draw="points",
+       field={"custom": {"drawStyle": "points", "showPoints": "always", "pointSize": 3}},
+       desc="Every connection's RSRP, coloured by band. Shows whether the modem's band choice is costing signal."),
+]
+y += 8
+
+panels.append(panel("table", "Connections", f"""
+select ts, label as device, operator, band, dl_mhz, bw_mhz, tac, cell_id, enb, sector, pci,
+       rsrp_dbm, rsrq_db, sinr, os_rsrp_dbm
+from connections {LBL}
+where {TF} and {DEV} order by ts desc limit 1000""", 0, y, 24, 10, fmt="table",
+    field={"custom": {"filterable": True}}, overrides=sig_overrides + [
+        {"matcher": {"id": "byName", "options": "os_rsrp_dbm"}, "properties": [{"id": "unit", "value": "dBm"}, {"id": "displayName", "value": "rsrp (OS)"}]}],
+    options={"showHeader": True, "cellHeight": "sm", "sortBy": [{"displayName": "ts", "desc": True}]},
+    desc="One row per report: serving cell and frequency from the modem's +UCGED, operator and the OS's own RSRP from the diagnostics of the same wake cycle. Newest 1000 in the range."))
+y += 10
 
 # ------------------------------------------------------------------ power
 panels.append(row("Power", y)); y += 1
