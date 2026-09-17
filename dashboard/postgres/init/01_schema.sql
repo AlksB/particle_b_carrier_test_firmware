@@ -5,6 +5,7 @@
 
 create table if not exists device (
     device_id     text primary key,
+    name          text,            -- from the Particle device list, synced by the ingest
     fw_version    int,             -- product firmware version from the last event
     app_hash      text,            -- spark/device/app-hash
     last_reset    text,            -- spark/device/last_reset
@@ -165,11 +166,14 @@ create index if not exists connect_failure_ts on connect_failure (ts);
 create index if not exists hook_event_ts      on hook_event (ts);
 
 -- ------------------------------------------------------------------ views
+-- drop + create rather than "or replace": the ingest re-runs this file at
+-- startup, and "or replace" refuses a view whose column list changed shape.
 
 -- Per-cycle deltas of the lifetime counters, one row per telemetry report.
 -- A negative delta means the device rebooted (counters live in RAM), so it
 -- is reported as null rather than a bogus number.
-create or replace view telemetry_delta as
+drop view if exists telemetry_delta;
+create view telemetry_delta as
 select ts, device_id, fw_version,
        nullif(greatest(connect_attempts   - lag(connect_attempts)   over w, -1), -1) as d_attempts,
        nullif(greatest(connect_successes  - lag(connect_successes)  over w, -1), -1) as d_successes,
@@ -180,8 +184,14 @@ select ts, device_id, fw_version,
 from telemetry
 window w as (partition by device_id order by ts);
 
+-- Name to show for a device: its Particle name, else the id.
+drop view if exists device_label;
+create view device_label as
+select device_id, coalesce(name, device_id) as label from device;
+
 -- One row per device with its latest state, for the "fleet now" table.
-create or replace view fleet_now as
+drop view if exists fleet_now;
+create view fleet_now as
 with t as (
     select distinct on (device_id) *
     from telemetry order by device_id, ts desc
@@ -200,6 +210,7 @@ with t as (
     group by device_id
 )
 select dev.device_id,
+       coalesce(dev.name, dev.device_id) as name,
        dev.last_seen,
        extract(epoch from now() - dev.last_seen)::int as silent_sec,
        s.status,

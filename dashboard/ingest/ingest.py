@@ -20,6 +20,10 @@ Usage:
   ingest.py particle_events.log --dry-run       # parse only, print counts
   curl -sN .../events | ingest.py -             # from stdin (a curl stream, a zcat of an archive)
 
+Device names are not in the events; --stream fetches the product device
+list on connect and every NAME_SYNC_SEC after, and --sync-names does it
+once. Both need PARTICLE_TOKEN.
+
 Connection: $DATABASE_URL (postgresql://user:pw@host:5432/db)
 Stream:     $PARTICLE_TOKEN, $PARTICLE_PRODUCT_ID (default 44896)
 """
@@ -46,6 +50,7 @@ API = "https://api.particle.io"
 
 BATCH = 2000        # rows per transaction when loading a backlog
 FLUSH_SEC = 2       # max age of an unflushed batch when streaming
+NAME_SYNC_SEC = 15 * 60   # how often --stream re-reads the device list
 
 
 # ------------------------------------------------------------------ parsing
@@ -333,6 +338,68 @@ def follow(path, poll_sec):
                     break  # truncated in place (copytruncate): start over
 
 
+# The init SQL only runs on an empty volume. An existing database is brought
+# up to date here at startup: columns added since the first release, then
+# the schema file itself, which is written to be idempotent (if not exists /
+# or replace), so views pick up their newest definition.
+MIGRATIONS = [
+    "alter table device add column if not exists name text",
+]
+SCHEMA_SQL = os.environ.get("SCHEMA_SQL") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "postgres", "init", "01_schema.sql")
+
+
+def migrate(conn):
+    with conn.cursor() as cur:
+        for sql in MIGRATIONS:
+            cur.execute(sql)
+        try:
+            with open(SCHEMA_SQL) as f:
+                cur.execute(f.read())
+        except FileNotFoundError:
+            log(f"schema file not found at {SCHEMA_SQL}, views not refreshed")
+    conn.commit()
+
+
+def fetch_device_names(token, product_id):
+    """{device_id: name} for every device in the product, all pages."""
+    names = {}
+    page = 1
+    while True:
+        url = f"{API}/v1/products/{product_id}/devices?perPage=100&page={page}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.load(resp)
+        for d in body.get("devices", []):
+            if d.get("name"):
+                names[d["id"]] = d["name"]
+        if page >= (body.get("meta") or {}).get("total_pages", 1):
+            return names
+        page += 1
+
+
+def sync_names(conn, token, product_id):
+    """Upserts names from the API. A device the API knows but no event has
+    mentioned yet gets a row with null timestamps, so the dashboard's device
+    list is the product's list, not just the devices heard from."""
+    try:
+        names = fetch_device_names(token, product_id)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log(f"name sync failed: {e}")
+        return
+    if conn is None:
+        log(f"name sync: {len(names)} names (dry run)")
+        return
+    with conn.cursor() as cur:
+        cur.executemany(
+            "insert into device (device_id, name) values (%s, %s) "
+            "on conflict (device_id) do update set name = excluded.name "
+            "where device.name is distinct from excluded.name",
+            list(names.items()))
+    conn.commit()
+    log(f"name sync: {len(names)} devices")
+
+
 def sse_stream(token, product_id, retry_sec=5, timeout_sec=60):
     """Yields lines from the product event stream, reconnecting whenever it
     drops. Particle sends `:ok` every ~9 s, so a 60 s read timeout catches a
@@ -358,12 +425,18 @@ def sse_stream(token, product_id, retry_sec=5, timeout_sec=60):
         time.sleep(retry_sec)
 
 
-def consume(loader, lines):
+def consume(loader, lines, every=None):
     """Runs SSE lines through the loader. None is an idle marker (no data
     right now); any other non event/data line - the `:ok` keepalive, the
-    shell script's connect markers - is a tick for the stale-batch flush."""
+    shell script's connect markers - is a tick for the stale-batch flush.
+    `every` is an optional (seconds, callable) run on ticks at that period."""
     name = None
+    next_every = 0
     for line in lines:
+        if every and time.time() >= next_every:
+            loader.flush()
+            every[1]()
+            next_every = time.time() + every[0]
         if line is None:
             loader.flush()
             continue
@@ -389,6 +462,8 @@ def main():
     ap.add_argument("logfile", nargs="?", help="event log path, or - for stdin")
     ap.add_argument("--stream", action="store_true",
                     help="read the live product event stream from api.particle.io instead of a file")
+    ap.add_argument("--sync-names", action="store_true",
+                    help="fetch device names from the product device list once, then exit")
     ap.add_argument("--follow", action="store_true", help="keep tailing the file after loading it")
     ap.add_argument("--poll", type=float, default=2.0, help="seconds between tail polls (default 2)")
     ap.add_argument("--dry-run", action="store_true", help="parse only, no database")
@@ -397,8 +472,8 @@ def main():
     ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL"),
                     help="postgresql://user:pw@host/db (default $DATABASE_URL)")
     args = ap.parse_args()
-    if bool(args.stream) == bool(args.logfile):
-        ap.error("give either a logfile or --stream")
+    if bool(args.stream) + bool(args.logfile) + bool(args.sync_names) != 1:
+        ap.error("give one of: a logfile, --stream, --sync-names")
 
     conn = None
     if not args.dry_run:
@@ -406,6 +481,7 @@ def main():
             sys.exit("error: set DATABASE_URL or pass --database-url")
         import psycopg
         conn = psycopg.connect(args.database_url)
+        migrate(conn)
 
     loader = Loader(conn, dry_run=args.dry_run, keep_raw=args.keep_raw,
                     verbose=args.stream or args.follow)
@@ -420,11 +496,15 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    if args.stream:
+    if args.stream or args.sync_names:
         token = os.environ.get("PARTICLE_TOKEN")
         if not token:
             sys.exit("error: set PARTICLE_TOKEN")
-        consume(loader, sse_stream(token, PRODUCT_ID))
+        if args.sync_names:
+            sync_names(conn, token, PRODUCT_ID)
+            return
+        consume(loader, sse_stream(token, PRODUCT_ID),
+                every=(NAME_SYNC_SEC, lambda: sync_names(conn, token, PRODUCT_ID)))
     elif args.logfile == "-":
         consume(loader, sys.stdin)
     elif args.follow:

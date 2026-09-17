@@ -38,7 +38,9 @@ services:
     # ports: ["127.0.0.1:5432:5432"]
 
   ingest:
-    build: ./ingest
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
@@ -85,7 +87,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      DOMAIN: ${DOMAIN:?set DOMAIN in .env for the https profile}
+      DOMAIN: ${DOMAIN:-}   # caddy refuses to start on an empty site address
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
       - caddy-data:/data

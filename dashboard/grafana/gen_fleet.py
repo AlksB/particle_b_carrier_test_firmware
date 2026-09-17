@@ -61,6 +61,9 @@ def ts(title, sql, x, y, w=12, h=8, unit=None, draw="line", field=None, desc=Non
 
 DEV = "device_id in ($device)"
 TF = "$__timeFilter(ts)"
+# every per-device series is labelled with the Particle device name, falling
+# back to the id (device_label view); the $device variable filters on ids
+LBL = "join device_label using (device_id)"
 panels = []
 y = 0
 
@@ -114,7 +117,7 @@ fleet_overrides = [
     {"matcher": {"id": "byName", "options": "last_seen"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
 ]
 panels.append(panel("table", "Fleet now", f"""
-select device_id, last_seen, silent_sec, status, fw_version, battery, vbat_idle, vbat_load,
+select name, device_id, last_seen, silent_sec, status, fw_version, battery, vbat_idle, vbat_load,
        rsrp_dbm, sinr, band, operator, connect_attempts, connect_successes, success_pct, failures_24h, reed_closed
 from fleet_now where {DEV} order by last_seen desc""", 0, y, 24, 11, fmt="table",
     field={"custom": {"filterable": True, "align": "auto"}}, overrides=fleet_overrides,
@@ -125,7 +128,7 @@ y += 11
 # ----------------------------------------------------------- connectivity
 panels.append(row("Connectivity", y)); y += 1
 panels.append(panel("state-timeline", "Online / offline", f"""
-select ts as time, device_id, status from device_status
+select ts as time, label as device, status from device_status {LBL}
 where {TF} and {DEV} order by ts""", 0, y, 24, 9, fmt="table",
     field={"custom": {"fillOpacity": 70, "lineWidth": 0}, "color": {"mode": "fixed"}},
     overrides=[
@@ -133,7 +136,7 @@ where {TF} and {DEV} order by ts""", 0, y, 24, 9, fmt="table",
     ],
     options={"mergeValues": True, "showValue": "never", "alignValue": "left", "rowHeight": 0.8,
              "legend": {"displayMode": "list", "placement": "bottom", "showLegend": True}},
-    transformations=[{"id": "partitionByValues", "options": {"fields": ["device_id"], "keepFields": False, "naming": {"asLabels": False}}}],
+    transformations=[{"id": "partitionByValues", "options": {"fields": ["device"], "keepFields": False, "naming": {"asLabels": False}}}],
     desc="spark/status events. Devices sleep between reports, so 'offline' is the normal resting state; what matters is the cadence."))
 # value mappings for colours
 panels[-1]["fieldConfig"]["defaults"]["mappings"] = [
@@ -143,33 +146,33 @@ y += 9
 
 panels += [
     ts("RSRP (Device OS diagnostics)", f"""
-select ts as time, device_id as metric, rsrp_dbm from diagnostics
+select ts as time, label as metric, rsrp_dbm from diagnostics {LBL}
 where {TF} and {DEV} and rsrp_dbm is not null order by ts""", 0, y, unit="dBm",
        desc="Serving-cell RSRP as reported at each cloud handshake. Below about -110 dBm Cat-M1 attach gets slow."),
     ts("SINR (rf_survey)", f"""
-select ts as time, device_id as metric, sinr from rf_survey
+select ts as time, label as metric, sinr from rf_survey {LBL}
 where {TF} and {DEV} order by ts""", 12, y, unit="dB"),
 ]
 y += 8
 panels += [
     ts("Attach time per cycle (Δ modemSearchSec)", f"""
-select ts as time, device_id as metric, d_search_sec from telemetry_delta
+select ts as time, label as metric, d_search_sec from telemetry_delta {LBL}
 where {TF} and {DEV} order by ts""", 0, y, unit="s", draw="points",
        field={"custom": {"drawStyle": "points", "showPoints": "always", "pointSize": 4}},
        desc="Seconds the modem spent searching for a network in each wake cycle. modemSearchSec is a lifetime counter; this is its difference between consecutive reports (null across a reboot)."),
     ts("Connect failures per hour", f"""
-select $__timeGroupAlias(ts, 1h), device_id as metric, count(*) as failures from connect_failure
+select $__timeGroupAlias(ts, 1h), label as metric, count(*) as failures from connect_failure {LBL}
 where {TF} and {DEV} group by 1, 2 order by 1""", 12, y, draw="bars",
        field={"custom": {"drawStyle": "bars", "fillOpacity": 70, "stacking": {"mode": "normal"}}}),
 ]
 y += 8
 panels.append(panel("table", "Recent connect failures", f"""
-select ts, device_id, search_sec, age_sec,
+select ts, label as device, search_sec, age_sec,
        substring(raw from '\\+CEER: ([^|]*)') as ceer,
        substring(raw from '\\+CGATT: ([0-9])') as cgatt,
        substring(raw from '\\+COPS: ([^|]*)') as cops,
        raw
-from connect_failure where {TF} and {DEV} order by ts desc limit 200""", 0, y, 24, 8, fmt="table",
+from connect_failure {LBL} where {TF} and {DEV} order by ts desc limit 200""", 0, y, 24, 8, fmt="table",
     field={"custom": {"filterable": True}},
     overrides=[{"matcher": {"id": "byName", "options": "ts"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
                {"matcher": {"id": "byName", "options": "raw"}, "properties": [{"id": "custom.width", "value": 600}]}],
@@ -180,10 +183,10 @@ y += 8
 panels.append(row("Power", y)); y += 1
 panels += [
     ts("Battery", f"""
-select ts as time, device_id as metric, battery from telemetry
+select ts as time, label as metric, battery from telemetry {LBL}
 where {TF} and {DEV} order by ts""", 0, y, unit="percent", field={"min": 0, "max": 100}),
     ts("Battery voltage (idle)", f"""
-select ts as time, device_id as metric, vbat_idle from telemetry
+select ts as time, label as metric, vbat_idle from telemetry {LBL}
 where {TF} and {DEV} order by ts""", 12, y, unit="volt", field={"decimals": 2}),
 ]
 y += 8
@@ -206,10 +209,10 @@ where hook = 'telemetry' and {TF} group by 1, 2 order by 1""", 12, y,
 y += 8
 panels += [
     panel("table", "Firmware versions", """
-select fw_version, count(*) as devices, string_agg(device_id, ', ' order by device_id) as device_ids
-from device group by 1 order by 1 desc""", 0, y, 12, 6, fmt="table"),
+select fw_version, count(*) as devices, string_agg(label, ', ' order by label) as device_names
+from device_label join device using (device_id) group by 1 order by 1 desc""", 0, y, 12, 6, fmt="table"),
     panel("table", "Resets & flashes", f"""
-select ts, device_id, name, data from other_event
+select ts, label as device, name as event, data from other_event {LBL}
 where {TF} and {DEV} order by ts desc limit 100""", 12, y, 12, 6, fmt="table",
           overrides=[{"matcher": {"id": "byName", "options": "ts"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]}],
           desc="spark/device/last_reset, spark/flash/status and app-hash events."),
@@ -228,7 +231,8 @@ dash = {
     "version": 1,
     "templating": {"list": [
         {"name": "device", "label": "Device", "type": "query", "datasource": DS,
-         "query": "select device_id from device order by 1", "definition": "select device_id from device order by 1",
+         "query": "select label as __text, device_id as __value from device_label order by 1",
+         "definition": "select label as __text, device_id as __value from device_label order by 1",
          "multi": True, "includeAll": True, "allValue": None, "refresh": 1, "sort": 1,
          "current": {"selected": True, "text": ["All"], "value": ["$__all"]}}
     ]},

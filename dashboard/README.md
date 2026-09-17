@@ -105,10 +105,23 @@ loop; useful with `tee -a` if you also want a raw log on disk.
 | `reed_changed`, `firmware_info` | same-named events | |
 | `hook_event` | `hook-sent/*`, `hook-response/*`, `hook-error/*` | webhook delivery audit |
 | `other_event` | `spark/flash/status`, `app-hash`, `last_reset` | |
-| `device` | every device event | last_seen, fw_version, app_hash, last_reset |
+| `device` | every device event + the product device list | name, last_seen, fw_version, app_hash, last_reset |
 
-Views: `fleet_now` (one row per device, latest of everything) and
-`telemetry_delta` (per-cycle differences of the lifetime counters).
+Views: `fleet_now` (one row per device, latest of everything),
+`telemetry_delta` (per-cycle differences of the lifetime counters) and
+`device_label` (name, or the id when there is none) which every panel
+joins for its series labels.
+
+Device names come from the Particle API, not from events: `--stream`
+fetches the product device list on connect and every 15 minutes, so a
+rename in the console shows up within that. `ingest.py --sync-names` does
+it once. Renaming is also how a device gets a label before its first
+event.
+
+Schema changes: `01_schema.sql` is written to be idempotent and the ingest
+re-runs it (plus any `alter table` in `MIGRATIONS`) at startup, so after
+`git pull` a `docker compose up -d --build` brings an existing database
+up to date - nothing to run by hand.
 `particle/device/updates/*` is dropped as noise.
 
 Sizes, for the 15-day / 20-device log: 39 MB of text becomes ~34 MB in
