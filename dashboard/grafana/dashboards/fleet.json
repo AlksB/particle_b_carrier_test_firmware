@@ -1,0 +1,1459 @@
+{
+ "uid": "fleet",
+ "title": "Fleet",
+ "tags": [
+  "particle"
+ ],
+ "timezone": "utc",
+ "editable": true,
+ "graphTooltip": 1,
+ "refresh": "1m",
+ "time": {
+  "from": "now-7d",
+  "to": "now"
+ },
+ "schemaVersion": 39,
+ "version": 1,
+ "templating": {
+  "list": [
+   {
+    "name": "device",
+    "label": "Device",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "fleet-pg"
+    },
+    "query": "select device_id from device order by 1",
+    "definition": "select device_id from device order by 1",
+    "multi": true,
+    "includeAll": true,
+    "allValue": null,
+    "refresh": 1,
+    "sort": 1,
+    "current": {
+     "selected": true,
+     "text": [
+      "All"
+     ],
+     "value": [
+      "$__all"
+     ]
+    }
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Fleet",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "Devices",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select count(*) from device",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value"
+   }
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Reported < 2 h",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 4,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select count(*) from fleet_now where silent_sec < 7200",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "green",
+        "value": 15
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value"
+   },
+   "description": "Devices heard from in the last two hours."
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Battery < 30 %",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select count(*) from fleet_now where battery < 30",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value"
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Connect failures",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select count(*) from connect_failure where $__timeFilter(ts)",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 20
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value"
+   },
+   "description": "connect_failure events in the selected time range."
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "Hook errors",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select count(*) from hook_event where kind='error' and $__timeFilter(ts)",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 100
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value"
+   },
+   "description": "Webhook deliveries Particle reported as failed in the selected time range."
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "Log freshness",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 20,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select extract(epoch from now() - max(last_seen)) from device",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 3600
+       },
+       {
+        "color": "red",
+        "value": 7200
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value"
+   },
+   "description": "Time since the newest event in the database. Grows if the SSE stream or the ingest stops."
+  },
+  {
+   "id": 8,
+   "type": "table",
+   "title": "Fleet now",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 5,
+    "w": 24,
+    "h": 11
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select device_id, last_seen, silent_sec, status, fw_version, battery, vbat_idle, vbat_load,\n       rsrp_dbm, sinr, band, operator, connect_attempts, connect_successes, success_pct, failures_24h, reed_closed\nfrom fleet_now where device_id in ($device) order by last_seen desc",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true,
+      "align": "auto"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "silent_sec"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       },
+       {
+        "id": "displayName",
+        "value": "silent"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 3600
+          },
+          {
+           "color": "red",
+           "value": 7200
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "battery"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percent"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 30
+          },
+          {
+           "color": "green",
+           "value": 50
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "rsrp_dbm"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dBm"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": -110
+          },
+          {
+           "color": "green",
+           "value": -100
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "sinr"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dB"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 0
+          },
+          {
+           "color": "green",
+           "value": 5
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "success_pct"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percent"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "red",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 70
+          },
+          {
+           "color": "green",
+           "value": 90
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "failures_24h"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-background"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 1
+          },
+          {
+           "color": "red",
+           "value": 5
+          }
+         ]
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "vbat_idle"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "volt"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "vbat_load"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "volt"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "last_seen"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "last_seen",
+      "desc": true
+     }
+    ]
+   },
+   "description": "Latest report from every device. Counters are lifetime totals; success_pct is successes/attempts over the device's whole life."
+  },
+  {
+   "id": 9,
+   "type": "row",
+   "title": "Connectivity",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 10,
+   "type": "state-timeline",
+   "title": "Online / offline",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 17,
+    "w": 24,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, device_id, status from device_status\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 70,
+      "lineWidth": 0
+     },
+     "color": {
+      "mode": "fixed"
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "online": {
+         "color": "green",
+         "index": 0
+        },
+        "offline": {
+         "color": "dark-gray",
+         "index": 1
+        },
+        "auto-update": {
+         "color": "blue",
+         "index": 2
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "mergeValues": true,
+    "showValue": "never",
+    "alignValue": "left",
+    "rowHeight": 0.8,
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    }
+   },
+   "transformations": [
+    {
+     "id": "partitionByValues",
+     "options": {
+      "fields": [
+       "device_id"
+      ],
+      "keepFields": false,
+      "naming": {
+       "asLabels": false
+      }
+     }
+    }
+   ],
+   "description": "spark/status events. Devices sleep between reports, so 'offline' is the normal resting state; what matters is the cadence."
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "RSRP (Device OS diagnostics)",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 26,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, device_id as metric, rsrp_dbm from diagnostics\nwhere $__timeFilter(ts) and device_id in ($device) and rsrp_dbm is not null order by ts",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "dBm",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "auto",
+      "pointSize": 3,
+      "spanNulls": 46800000
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "Serving-cell RSRP as reported at each cloud handshake. Below about -110 dBm Cat-M1 attach gets slow."
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "SINR (rf_survey)",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 26,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, device_id as metric, sinr from rf_survey\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "dB",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "auto",
+      "pointSize": 3,
+      "spanNulls": 46800000
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Attach time per cycle (Δ modemSearchSec)",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 34,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, device_id as metric, d_search_sec from telemetry_delta\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "points",
+      "showPoints": "always",
+      "pointSize": 4
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "Seconds the modem spent searching for a network in each wake cycle. modemSearchSec is a lifetime counter; this is its difference between consecutive reports (null across a reboot)."
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Connect failures per hour",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 34,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select $__timeGroupAlias(ts, 1h), device_id as metric, count(*) as failures from connect_failure\nwhere $__timeFilter(ts) and device_id in ($device) group by 1, 2 order by 1",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "bars",
+      "fillOpacity": 70,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 15,
+   "type": "table",
+   "title": "Recent connect failures",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 42,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts, device_id, search_sec, age_sec,\n       substring(raw from '\\+CEER: ([^|]*)') as ceer,\n       substring(raw from '\\+CGATT: ([0-9])') as cgatt,\n       substring(raw from '\\+COPS: ([^|]*)') as cops,\n       raw\nfrom connect_failure where $__timeFilter(ts) and device_id in ($device) order by ts desc limit 200",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ts"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "raw"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 600
+       }
+      ]
+     }
+    ]
+   },
+   "options": {},
+   "description": "AT dump captured when the connect budget ran out. CEER is the modem's reject cause; CGATT 0 = never attached."
+  },
+  {
+   "id": 16,
+   "type": "row",
+   "title": "Power",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 50,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 17,
+   "type": "timeseries",
+   "title": "Battery",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 51,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, device_id as metric, battery from telemetry\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "auto",
+      "pointSize": 3,
+      "spanNulls": 46800000
+     },
+     "min": 0,
+     "max": 100
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 18,
+   "type": "timeseries",
+   "title": "Battery voltage (idle)",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 51,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts as time, device_id as metric, vbat_idle from telemetry\nwhere $__timeFilter(ts) and device_id in ($device) order by ts",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "volt",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "auto",
+      "pointSize": 3,
+      "spanNulls": 46800000
+     },
+     "decimals": 2
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 19,
+   "type": "row",
+   "title": "Backend",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 59,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "Webhook errors per hour, by cause",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 60,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select $__timeGroupAlias(ts, 1h),\n       coalesce(substring(message from 'from (.*)$'), message) as metric,\n       count(*) as errors\nfrom hook_event where kind = 'error' and $__timeFilter(ts) group by 1, 2 order by 1",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "bars",
+      "fillOpacity": 70,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "hook-error events grouped by the host (or Particle's own message) that produced them."
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "Webhook deliveries per hour",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 60,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select $__timeGroupAlias(ts, 1h), kind as metric, count(*) from hook_event\nwhere hook = 'telemetry' and $__timeFilter(ts) group by 1, 2 order by 1",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "auto",
+      "pointSize": 3,
+      "spanNulls": 46800000
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "For the telemetry hook: sent vs. response (delivered) vs. error. sent counts every configured integration, so it is a multiple of the telemetry rows."
+  },
+  {
+   "id": 22,
+   "type": "table",
+   "title": "Firmware versions",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 68,
+    "w": 12,
+    "h": 6
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select fw_version, count(*) as devices, string_agg(device_id, ', ' order by device_id) as device_ids\nfrom device group by 1 order by 1 desc",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 23,
+   "type": "table",
+   "title": "Resets & flashes",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 68,
+    "w": 12,
+    "h": 6
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select ts, device_id, name, data from other_event\nwhere $__timeFilter(ts) and device_id in ($device) order by ts desc limit 100",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ts"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {},
+   "description": "spark/device/last_reset, spark/flash/status and app-hash events."
+  }
+ ]
+}

@@ -62,3 +62,6 @@ src/build_info.h
 
 # Python bytecode cache, left behind by flash_watcher.py
 __pycache__/
+
+# dashboard stack secrets
+dashboard/.env

@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+RUN pip install --no-cache-dir "psycopg[binary]==3.2.*"
+COPY ingest.py /ingest.py
+ENTRYPOINT ["python3", "-u", "/ingest.py"]
