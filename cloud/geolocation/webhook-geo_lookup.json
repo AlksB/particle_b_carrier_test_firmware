@@ -1,0 +1,24 @@
+{
+  "name": "geo_lookup",
+  "event": "geo_lookup",
+  "template": "webhook",
+  "url": "https://www.googleapis.com/geolocation/v1/geolocate",
+  "requestType": "POST",
+  "noDefaults": true,
+  "rejectUnauthorized": true,
+  "unchunked": true,
+  "data_url_response_event": false,
+  "secrets": [
+    { "name": "GOOGLE_GEOLOCATION_API_KEY" }
+  ],
+  "query": {
+    "key": "{{{GOOGLE_GEOLOCATION_API_KEY}}}"
+  },
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": "{\"considerIp\":false,\"radioType\":\"{{rat}}\",\"cellTowers\":[{\"mobileCountryCode\":{{mcc}},\"mobileNetworkCode\":{{mnc}},\"locationAreaCode\":{{lac}},\"cellId\":{{cid}},\"signalStrength\":{{rsrp}}}]}",
+  "responseTemplate": "{{{PARTICLE_DEVICE_ID}}},{{location.lat}},{{location.lng}},{{accuracy}}",
+  "responseTopic": "hook-response/geo_lookup",
+  "errorResponseTopic": "hook-error/geo_lookup"
+}
