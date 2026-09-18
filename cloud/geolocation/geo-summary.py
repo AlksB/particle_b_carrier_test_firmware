@@ -20,7 +20,7 @@ for k, v in cnt.most_common():
 
 print('\n--- geo chain ---')
 for r in rows:
-    if r[0] in ('geo_lookup', 'hook-response/geo_lookup', 'hook-error/geo_lookup', 'geo_fix'):
+    if r[0] in ('geo_lookup', 'hook-response/geo_lookup', 'hook-error/geo_lookup', 'geolocation'):
         print(r[3], '|', r[0], '|', r[1][:110])
 
 print('\n--- vitals with tower (time, rat, cid, rsrp) ---')

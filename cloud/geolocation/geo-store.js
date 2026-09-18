@@ -6,8 +6,8 @@ import Particle from 'particle:core';
 // (event.deviceId is "particle-internal").
 //
 // Stores the fix on the tower geo-check asked about (`current`), promotes it
-// to the top-level fix, and republishes it as a `geo_fix` event from the
-// device so the site consumes it like any other device event.
+// to the top-level fix, and publishes it as a `geolocation` event from the
+// device (cached: false) so the site consumes it like any other device event.
 
 export default function process({ event }) {
   if (!event.eventData) return;
@@ -35,7 +35,7 @@ export default function process({ event }) {
 
   ledger.set({ lat, lng, accuracy, fetchedAt: now, pending: false, towers }, Particle.MERGE);
 
-  Particle.publish('geo_fix',
+  Particle.publish('geolocation',
     { lat, lng, accuracy, mcc: t.mcc, mnc: t.mnc, lac: t.lac, cid: t.cid, cached: false },
     { productId: event.productId, asDeviceId: deviceId });
 }

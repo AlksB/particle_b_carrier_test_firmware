@@ -7,15 +7,17 @@ Cloud services plus one Google Geolocation API call per newly seen tower.
 
     vitals ──▶ geo-check ──▶ geo_lookup ──▶ webhook ──▶ Google
                   │                                       │
-                  │ known tower: geo_fix (cached)          ▼
-                  └──────────── ledger `geo` ◀── geo-store ──▶ geo_fix
+                  │ known tower: geolocation (cached)      ▼
+                  └──────────── ledger `geo` ◀── geo-store ──▶ geolocation
 
-Devices publish `geo_fix {lat, lng, accuracy, mcc, mnc, lac, cid, cached}`
-only when their fix changes. "Still there" is `confirmedAt` in the ledger.
+Every connection ends in one `geolocation {lat, lng, accuracy, mcc, mnc, lac,
+cid, cached}` event from the device: `cached: true` when the tower was
+already in the device's map (no Google call), `cached: false` when Google
+was just asked. A tower Google does not know produces no event.
 Accuracy is ~150–200 m in a dense city, ~1 km or worse elsewhere.
 
-Cost: ~2 Data Operations per connection (Logic run + ledger set) and 3 more
-per tower change; Google is called once per tower per 90 days, so a fleet of
+Cost: ~3 Data Operations per connection (Logic run + ledger set +
+geolocation event) and 3 more per tower change; Google is called once per tower per 90 days, so a fleet of
 2000 stationary devices stays inside Google's free 10K requests/month.
 
 ## Files
@@ -23,7 +25,7 @@ per tower change; Google is called once per tower per 90 days, so a fleet of
 | file | what |
 |---|---|
 | `geo-check.js` | Logic. Trigger `spark/device/diagnostics/update`. Decides: confirm / cached fix / ask Google. |
-| `geo-store.js` | Logic. Trigger `hook-response/geo_lookup`. Writes Google's answer to the ledger, publishes `geo_fix`. |
+| `geo-store.js` | Logic. Trigger `hook-response/geo_lookup`. Writes Google's answer to the ledger, publishes `geolocation`. |
 | `webhook-geo_lookup.json` | Integration template (Custom template tab). Calls Google, returns `{deviceId, lat, lng, accuracy}`. |
 | `export-console-events.js` | Browser snippet: dump the virtualized console event table to `events.tsv`. |
 | `geo-summary.py` | Count lookups vs connections vs tower changes in an `events.tsv`. |
@@ -52,7 +54,7 @@ Administrator), and 2FA enabled on your account.
    object, e.g. `{"device":{"network":{"cellular":{"radio_access_technology":"LTE","cell_global_identity":{"mobile_country_code":310,"mobile_network_code":"410","location_area_code":36877,"cell_id":84534800}},"signal":{"strengthv":-103}}}}`.
    Deploy with trigger `spark/device/diagnostics/update` on the product.
 6. Reset a device (or wait for its next connection) and watch the product
-   event stream for `geo_lookup → hook-sent → hook-response → geo_fix`.
+   event stream for `geo_lookup → hook-sent → hook-response → geolocation`.
 
 Numeric product ID (needed for `particle publish --product` and the REST
 paths) is in the webhook error log or the product URL, not the slug.
@@ -74,7 +76,7 @@ paths) is in the webhook error log or the product URL, not the slug.
 
 ## Reading the result
 
-Event: `geo_fix` on the product stream (an API user with scope `events:get`
+Event: `geolocation` on the product stream (an API user with scope `events:get`
 is enough for a site). Or REST:
 
     GET https://api.particle.io/v1/products/<id>/ledgers/geo/instances/<deviceId>

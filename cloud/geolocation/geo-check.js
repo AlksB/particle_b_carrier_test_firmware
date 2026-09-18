@@ -5,10 +5,11 @@ import Particle from 'particle:core';
 // change is needed.
 //
 // The device's `geo` ledger keeps a map of recently seen towers with their
-// fixes. Same tower as last time -> bump confirmedAt. A different but already
-// known tower -> republish its cached fix, no Google call. Unknown or stale
-// tower -> publish geo_lookup; the webhook asks Google and geo-store writes the
-// answer back. A lookup that never got an answer is marked notFound here.
+// fixes. Every run ends in one `geolocation` event from the device: a tower
+// already in the map is answered straight from the cache (cached: true);
+// an unknown or stale tower publishes geo_lookup, the webhook asks Google,
+// and geo-store publishes the answer (cached: false). A lookup that never
+// got an answer is marked notFound here and produces no event.
 
 const STALE_DAYS = 90;      // tower coordinates don't move; re-ask rarely
 const NOTFOUND_DAYS = 7;    // but Google keeps adding towers; retry misses sooner
@@ -63,12 +64,12 @@ export default function process({ event }) {
   evict(towers, key);
 
   if (fresh) {
-    const changed = cur.current !== key;
     const update = { current: key, confirmedAt: now, pending: false, towers };
-    if (changed && known.lat != null) {
-      // Back on a tower we already located: serve the fix from cache.
+    if (known.lat != null) {
+      // Tower already located (same one as last time, or one we came back
+      // to): answer from the cache, no Google call.
       update.lat = known.lat; update.lng = known.lng; update.accuracy = known.accuracy;
-      Particle.publish('geo_fix',
+      Particle.publish('geolocation',
         { lat: known.lat, lng: known.lng, accuracy: known.accuracy,
           mcc: tower.mcc, mnc: tower.mnc, lac: tower.lac, cid: tower.cid, cached: true },
         { productId: event.productId, asDeviceId: event.deviceId });
