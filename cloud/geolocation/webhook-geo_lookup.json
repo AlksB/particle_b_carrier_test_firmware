@@ -18,7 +18,7 @@
     "Content-Type": "application/json"
   },
   "body": "{\"considerIp\":false,\"radioType\":\"{{rat}}\",\"cellTowers\":[{\"mobileCountryCode\":{{mcc}},\"mobileNetworkCode\":{{mnc}},\"locationAreaCode\":{{lac}},\"cellId\":{{cid}},\"signalStrength\":{{rsrp}}}]}",
-  "responseTemplate": "{{{PARTICLE_DEVICE_ID}}},{{location.lat}},{{location.lng}},{{accuracy}}",
+  "responseTemplate": "{\"deviceId\":\"{{{PARTICLE_DEVICE_ID}}}\",\"lat\":{{location.lat}},\"lng\":{{location.lng}},\"accuracy\":{{accuracy}}}",
   "responseTopic": "hook-response/geo_lookup",
   "errorResponseTopic": "hook-error/geo_lookup"
 }

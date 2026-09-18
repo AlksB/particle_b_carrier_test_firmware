@@ -1,7 +1,7 @@
 import Particle from 'particle:core';
 
 // Trigger: hook-response/geo_lookup — Google answered the geo_lookup webhook.
-// Response template: "<deviceId>,<lat>,<lng>,<accuracy>". The device ID has to
+// Response template: {"deviceId","lat","lng","accuracy"}. The device ID has to
 // travel in the body: hook-response events are not attributed to the device
 // (event.deviceId is "particle-internal").
 //
@@ -12,8 +12,9 @@ import Particle from 'particle:core';
 export default function process({ event }) {
   if (!event.eventData) return;
 
-  const [deviceId, latS, lngS, accS] = event.eventData.split(',');
-  const lat = Number(latS), lng = Number(lngS), accuracy = Number(accS);
+  let r;
+  try { r = JSON.parse(event.eventData); } catch { r = null; }
+  const { deviceId, lat, lng, accuracy } = r || {};
   if (!deviceId || !isFinite(lat) || !isFinite(lng)) {
     console.error('bad hook response', event.eventData);
     return;

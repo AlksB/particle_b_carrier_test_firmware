@@ -24,7 +24,7 @@ per tower change; Google is called once per tower per 90 days, so a fleet of
 |---|---|
 | `geo-check.js` | Logic. Trigger `spark/device/diagnostics/update`. Decides: confirm / cached fix / ask Google. |
 | `geo-store.js` | Logic. Trigger `hook-response/geo_lookup`. Writes Google's answer to the ledger, publishes `geo_fix`. |
-| `webhook-geo_lookup.json` | Integration template (Custom template tab). Calls Google, returns `deviceId,lat,lng,accuracy`. |
+| `webhook-geo_lookup.json` | Integration template (Custom template tab). Calls Google, returns `{deviceId, lat, lng, accuracy}`. |
 | `export-console-events.js` | Browser snippet: dump the virtualized console event table to `events.tsv`. |
 | `geo-summary.py` | Count lookups vs connections vs tower changes in an `events.tsv`. |
 
@@ -44,9 +44,9 @@ Administrator), and 2FA enabled on your account.
    Webhook → Custom template → paste `webhook-geo_lookup.json`, tick the
    secret. Test: publish `geo_lookup` from the product event stream with
    `{"rat":"lte","mcc":310,"mnc":410,"lac":36877,"cid":84534800,"rsrp":-95}`;
-   a `hook-response/geo_lookup` with three numbers must follow.
+   a `hook-response/geo_lookup` JSON must follow (deviceId empty for a manual publish).
 4. **Logic `geo-store`** — Event-triggered, paste `geo-store.js`. Test data
-   `0a10aced202194944a060ad0,41.6968,44.7945,154` with a real device ID.
+   `{"deviceId":"0a10aced202194944a060ad0","lat":41.6968,"lng":44.7945,"accuracy":154}` with a real device ID.
    Deploy with trigger `hook-response/geo_lookup` on the product.
 5. **Logic `geo-check`** — paste `geo-check.js`. Test data: a trimmed vitals
    object, e.g. `{"device":{"network":{"cellular":{"radio_access_technology":"LTE","cell_global_identity":{"mobile_country_code":310,"mobile_network_code":"410","location_area_code":36877,"cell_id":84534800}},"signal":{"strengthv":-103}}}}`.
