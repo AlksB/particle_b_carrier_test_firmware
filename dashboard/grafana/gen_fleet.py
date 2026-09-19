@@ -143,6 +143,72 @@ from fleet_now where {DEV} order by last_seen desc""", 0, y, 24, 11, fmt="table"
     desc="Latest report from every device. Counters are lifetime totals; success_pct is successes/attempts over the device's whole life."))
 y += 11
 
+# -------------------------------------------------------------------- map
+panels.append(row("Map", y)); y += 1
+silent_th = thresholds((None, "green"), (8 * 3600, "orange"), (14 * 3600, "red"))["thresholds"]
+panels.append(panel("geomap", "Where the devices are", f"""
+select name, device_id, lat, lng, accuracy_m, fix_at, on_tower_since, silent_sec,
+       status, battery, rsrp_dbm, sinr, operator
+from fleet_now where lat is not null and {DEV}""", 0, y, 24, 14, fmt="table",
+    field={"custom": {"hideFrom": {"legend": False, "tooltip": False, "viz": False}}},
+    overrides=[
+        {"matcher": {"id": "byName", "options": "silent_sec"},
+         "properties": [{"id": "unit", "value": "s"}, {"id": "displayName", "value": "silent"},
+                        {"id": "thresholds", "value": silent_th}, {"id": "color", "value": {"mode": "thresholds"}}]},
+        {"matcher": {"id": "byName", "options": "accuracy_m"}, "properties": [{"id": "unit", "value": "lengthm"}, {"id": "decimals", "value": 0}]},
+        {"matcher": {"id": "byName", "options": "battery"}, "properties": [{"id": "unit", "value": "percent"}]},
+        {"matcher": {"id": "byName", "options": "rsrp_dbm"}, "properties": [{"id": "unit", "value": "dBm"}]},
+        {"matcher": {"id": "byName", "options": "fix_at"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+        {"matcher": {"id": "byName", "options": "on_tower_since"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+        {"matcher": {"id": "byName", "options": "lat"}, "properties": [{"id": "decimals", "value": 5}]},
+        {"matcher": {"id": "byName", "options": "lng"}, "properties": [{"id": "decimals", "value": 5}]},
+    ],
+    options={
+        "view": {"id": "fit", "allLayers": True, "padding": 30, "lastOnly": False},
+        "controls": {"showZoom": True, "mouseWheelZoom": True, "showAttribution": True, "showScale": True, "showMeasure": False, "showDebug": False},
+        "basemap": {"type": "default", "name": "Basemap"},
+        "tooltip": {"mode": "details"},
+        "layers": [{
+            "type": "markers", "name": "Devices", "tooltip": True,
+            "location": {"mode": "coords", "latitude": "lat", "longitude": "lng"},
+            "config": {
+                "showLegend": True,
+                "style": {
+                    "size": {"fixed": 9, "min": 4, "max": 20},
+                    "color": {"field": "silent_sec", "fixed": "green"},
+                    "opacity": 0.85,
+                    "symbol": {"mode": "fixed", "fixed": "img/icons/marker/circle.svg"},
+                    "symbolAlign": {"horizontal": "center", "vertical": "center"},
+                    "text": {"mode": "field", "field": "name", "fixed": ""},
+                    "textConfig": {"fontSize": 12, "offsetX": 0, "offsetY": -13, "textAlign": "center", "textBaseline": "middle"},
+                    "rotation": {"mode": "fixed", "fixed": 0},
+                },
+            },
+        }],
+    },
+    desc="Newest cell-tower geolocation per device (cloud/geolocation: Google's position for the serving cell, so a device sits at its tower, within accuracy_m). Colour: time since the device last reported - green under 8 h, red past 14 h (two missed 6-hourly reports). Hover for the details."))
+y += 14
+
+panels += [
+    panel("table", "Positions", f"""
+select label as device, lat, lng, accuracy_m, tower, cell_id, cached, fix_at, on_tower_since
+from device_position {LBL} where {DEV} order by fix_at desc""", 0, y, 14, 8, fmt="table",
+          field={"custom": {"filterable": True}},
+          overrides=[{"matcher": {"id": "byName", "options": "accuracy_m"}, "properties": [{"id": "unit", "value": "lengthm"}, {"id": "decimals", "value": 0}]},
+                     {"matcher": {"id": "byName", "options": "fix_at"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+                     {"matcher": {"id": "byName", "options": "on_tower_since"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}]},
+                     {"matcher": {"id": "byName", "options": "lat"}, "properties": [{"id": "decimals", "value": 5}]},
+                     {"matcher": {"id": "byName", "options": "lng"}, "properties": [{"id": "decimals", "value": 5}]}],
+          desc="Latest fix per device. tower is mcc-mnc-lac-cid; on_tower_since is when the device last changed tower, so a stationary device shows its install date here."),
+    ts("Geolocation fixes per day", f"""
+select $__timeGroupAlias(ts, 1d),
+       case when cached then 'cached' else 'google lookup' end as metric, count(*)
+from geolocation where {TF} and {DEV} group by 1, 2 order by 1""", 14, y, w=10, draw="bars",
+       field={"custom": {"drawStyle": "bars", "fillOpacity": 70, "stacking": {"mode": "normal"}}},
+       desc="Every connection yields one fix; 'google lookup' is a tower the device had not seen before (or one older than 90 days) - that is what costs a Geolocation API call."),
+]
+y += 8
+
 # ----------------------------------------------------------- connectivity
 panels.append(row("Connectivity", y)); y += 1
 panels.append(panel("state-timeline", "Online / offline", f"""

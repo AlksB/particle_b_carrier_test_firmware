@@ -96,6 +96,25 @@ create table if not exists firmware_info (
     primary key (device_id, ts)
 );
 
+-- geolocation: published as the device by the Logic functions in
+-- cloud/geolocation on every connection - the serving cell's position from
+-- Google's geolocation API (cached = answered from the device's tower map
+-- without a Google call). accuracy_m is Google's radius: ~150-200 m in a
+-- city, a kilometre or worse outside.
+create table if not exists geolocation (
+    ts          timestamptz not null,
+    device_id   text        not null,
+    lat         double precision,
+    lng         double precision,
+    accuracy_m  real,
+    mcc         int,
+    mnc         text,
+    lac         int,
+    cid         bigint,
+    cached      bool,
+    primary key (device_id, ts)
+);
+
 -- spark/device/diagnostics/update: the fields worth a column. raw holds the
 -- whole payload only when the ingest runs with --keep-raw (~2 KB per row).
 create table if not exists diagnostics (
@@ -163,16 +182,19 @@ create index if not exists telemetry_ts       on telemetry (ts);
 create index if not exists rf_survey_ts       on rf_survey (ts);
 create index if not exists diagnostics_ts     on diagnostics (ts);
 create index if not exists connect_failure_ts on connect_failure (ts);
+create index if not exists geolocation_ts     on geolocation (ts);
 create index if not exists hook_event_ts      on hook_event (ts);
 
 -- ------------------------------------------------------------------ views
 -- drop + create rather than "or replace": the ingest re-runs this file at
 -- startup, and "or replace" refuses a view whose column list changed shape.
+-- cascade, because fleet_now is built on the others and gets recreated
+-- further down anyway.
 
 -- Per-cycle deltas of the lifetime counters, one row per telemetry report.
 -- A negative delta means the device rebooted (counters live in RAM), so it
 -- is reported as null rather than a bogus number.
-drop view if exists telemetry_delta;
+drop view if exists telemetry_delta cascade;
 create view telemetry_delta as
 select ts, device_id, fw_version,
        nullif(greatest(connect_attempts   - lag(connect_attempts)   over w, -1), -1) as d_attempts,
@@ -219,7 +241,7 @@ language sql immutable as $$
 $$;
 
 -- Name to show for a device: its Particle name, else the id.
-drop view if exists device_label;
+drop view if exists device_label cascade;
 create view device_label as
 select device_id, coalesce(name, device_id) as label from device;
 
@@ -230,7 +252,7 @@ select device_id, coalesce(name, device_id) as label from device;
 -- splits into eNodeB (upper 20 bits, the tower) and sector (low 8 bits).
 -- RSRP/RSRQ come as 3GPP 36.133 indices: dBm = idx - 141, dB = idx/2 - 20;
 -- -1 means the modem did not report them.
-drop view if exists connections;
+drop view if exists connections cascade;
 create view connections as
 select r.ts, r.device_id,
        d.operator, d.mcc, d.mnc,
@@ -262,7 +284,7 @@ left join lateral (
 -- the modem was attached, and the cell it was camped on (the UCGED row in
 -- the dump has the same layout as rf_survey). band 255 / cell ffffffff is
 -- the modem's "no cell".
-drop view if exists connect_failures;
+drop view if exists connect_failures cascade;
 create view connect_failures as
 select ts, device_id, search_sec, age_sec,
        substring(raw from '\+CEER: ([^|]*)')          as ceer,
@@ -293,8 +315,31 @@ from (
           from connect_failure) f
 ) f;
 
+-- Where each device is: its newest fix, and how long it has been on that
+-- tower. The geolocation event names the tower (mcc-mnc-lac-cid), so a
+-- device that moved shows a new key and a new since.
+drop view if exists device_position cascade;
+create view device_position as
+with g as (
+    select *,
+           mcc || '-' || mnc || '-' || lac || '-' || cid as tower,
+           lag(mcc || '-' || mnc || '-' || lac || '-' || cid) over (partition by device_id order by ts) as prev_tower
+    from geolocation
+    where lat is not null
+), runs as (
+    select *, sum(case when tower is distinct from prev_tower then 1 else 0 end)
+                  over (partition by device_id order by ts) as run
+    from g
+), latest as (
+    select distinct on (device_id) * from runs order by device_id, ts desc
+)
+select l.device_id, l.ts as fix_at, l.lat, l.lng, l.accuracy_m, l.tower, l.cached,
+       to_hex(l.cid) as cell_id,
+       (select min(ts) from runs r where r.device_id = l.device_id and r.run = l.run) as on_tower_since
+from latest l;
+
 -- One row per device with its latest state, for the "fleet now" table.
-drop view if exists fleet_now;
+drop view if exists fleet_now cascade;
 create view fleet_now as
 with t as (
     select distinct on (device_id) *
@@ -312,6 +357,8 @@ with t as (
     select device_id, count(*) as failures_24h
     from connect_failure where ts > now() - interval '24 hours'
     group by device_id
+), g as (
+    select device_id, lat, lng, accuracy_m, fix_at, on_tower_since from device_position
 )
 select dev.device_id,
        coalesce(dev.name, dev.device_id) as name,
@@ -325,10 +372,12 @@ select dev.device_id,
        t.connect_attempts, t.connect_successes,
        round(100.0 * t.connect_successes / nullif(t.connect_attempts, 0), 1) as success_pct,
        coalesce(cf.failures_24h, 0) as failures_24h,
-       t.reed_closed
+       t.reed_closed,
+       g.lat, g.lng, g.accuracy_m, g.fix_at, g.on_tower_since
 from device dev
 left join t  using (device_id)
 left join d  using (device_id)
 left join r  using (device_id)
 left join s  using (device_id)
-left join cf using (device_id);
+left join cf using (device_id)
+left join g  using (device_id);

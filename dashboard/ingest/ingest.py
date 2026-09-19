@@ -41,9 +41,12 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 DEVICE_ID = re.compile(r"^[0-9a-f]{24}$")
-HOOK_RESPONSE = re.compile(r"^([0-9a-f]{24})/hook-response/(.+)/\d+$")
+# Webhook echo. The default topics are <deviceid>/hook-response/<hook>/<n>
+# and hook-error/<hook>/<n>; an integration with unchunked: true and its own
+# responseTopic has neither the device prefix nor the /<n> chunk suffix.
+HOOK_RESPONSE = re.compile(r"^(?:([0-9a-f]{24})/)?hook-response/(.+?)(?:/\d+)?$")
 HOOK_SENT = re.compile(r"^hook-sent/(.+)$")
-HOOK_ERROR = re.compile(r"^hook-error/(.+)/\d+$")
+HOOK_ERROR = re.compile(r"^hook-error/(.+?)(?:/\d+)?$")
 
 PRODUCT_ID = os.environ.get("PARTICLE_PRODUCT_ID", "44896")
 API = "https://api.particle.io"
@@ -171,6 +174,15 @@ def route(name, env, keep_raw=False):
     if name == "firmware_info" and isinstance(p, dict):
         return "firmware_info", (ts, dev, to_int(p.get("version")), p.get("commit"))
 
+    # published *as* the device by the geo-store / geo-check Logic functions
+    # (cloud/geolocation): a fix for the serving cell, from Google or cache
+    if name == "geolocation" and isinstance(p, dict):
+        return "geolocation", (
+            ts, dev, to_float(p.get("lat")), to_float(p.get("lng")), to_float(p.get("accuracy")),
+            to_int(p.get("mcc")), p.get("mnc") if p.get("mnc") is None else str(p.get("mnc")),
+            to_int(p.get("lac")), to_int(p.get("cid")), to_bool(p.get("cached")),
+        )
+
     if name == "spark/device/diagnostics/update" and isinstance(p, dict):
         d = p.get("device", {})
         cell = dig(d, "network", "cellular") or {}
@@ -212,6 +224,7 @@ INSERT = {
     "reed_changed":    "insert into reed_changed values (%s,%s,%s,%s) on conflict do nothing",
     "firmware_info":   "insert into firmware_info values (%s,%s,%s,%s) on conflict do nothing",
     "diagnostics":     "insert into diagnostics values (" + ",".join(["%s"] * 33) + ") on conflict do nothing",
+    "geolocation":     "insert into geolocation values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict do nothing",
     "hook_event":      "insert into hook_event values (%s,%s,%s,%s,%s) on conflict do nothing",
     "other_event":     "insert into other_event values (%s,%s,%s,%s) on conflict do nothing",
 }
@@ -344,6 +357,11 @@ def follow(path, poll_sec):
 # or replace), so views pick up their newest definition.
 MIGRATIONS = [
     "alter table device add column if not exists name text",
+    """create table if not exists geolocation (
+        ts timestamptz not null, device_id text not null,
+        lat double precision, lng double precision, accuracy_m real,
+        mcc int, mnc text, lac int, cid bigint, cached bool,
+        primary key (device_id, ts))""",
 ]
 SCHEMA_SQL = os.environ.get("SCHEMA_SQL") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "postgres", "init", "01_schema.sql")

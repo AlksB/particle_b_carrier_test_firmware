@@ -768,7 +768,7 @@
   {
    "id": 9,
    "type": "row",
-   "title": "Connectivity",
+   "title": "Map",
    "collapsed": false,
    "gridPos": {
     "x": 0,
@@ -780,6 +780,420 @@
   },
   {
    "id": 10,
+   "type": "geomap",
+   "title": "Where the devices are",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 17,
+    "w": 24,
+    "h": 14
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select name, device_id, lat, lng, accuracy_m, fix_at, on_tower_since, silent_sec,\n       status, battery, rsrp_dbm, sinr, operator\nfrom fleet_now where lat is not null and device_id in ($device)",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "silent_sec"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       },
+       {
+        "id": "displayName",
+        "value": "silent"
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "green",
+           "value": null
+          },
+          {
+           "color": "orange",
+           "value": 28800
+          },
+          {
+           "color": "red",
+           "value": 50400
+          }
+         ]
+        }
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "thresholds"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "accuracy_m"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "lengthm"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "battery"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percent"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "rsrp_dbm"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dBm"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "fix_at"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "on_tower_since"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "lat"
+      },
+      "properties": [
+       {
+        "id": "decimals",
+        "value": 5
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "lng"
+      },
+      "properties": [
+       {
+        "id": "decimals",
+        "value": 5
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "view": {
+     "id": "fit",
+     "allLayers": true,
+     "padding": 30,
+     "lastOnly": false
+    },
+    "controls": {
+     "showZoom": true,
+     "mouseWheelZoom": true,
+     "showAttribution": true,
+     "showScale": true,
+     "showMeasure": false,
+     "showDebug": false
+    },
+    "basemap": {
+     "type": "default",
+     "name": "Basemap"
+    },
+    "tooltip": {
+     "mode": "details"
+    },
+    "layers": [
+     {
+      "type": "markers",
+      "name": "Devices",
+      "tooltip": true,
+      "location": {
+       "mode": "coords",
+       "latitude": "lat",
+       "longitude": "lng"
+      },
+      "config": {
+       "showLegend": true,
+       "style": {
+        "size": {
+         "fixed": 9,
+         "min": 4,
+         "max": 20
+        },
+        "color": {
+         "field": "silent_sec",
+         "fixed": "green"
+        },
+        "opacity": 0.85,
+        "symbol": {
+         "mode": "fixed",
+         "fixed": "img/icons/marker/circle.svg"
+        },
+        "symbolAlign": {
+         "horizontal": "center",
+         "vertical": "center"
+        },
+        "text": {
+         "mode": "field",
+         "field": "name",
+         "fixed": ""
+        },
+        "textConfig": {
+         "fontSize": 12,
+         "offsetX": 0,
+         "offsetY": -13,
+         "textAlign": "center",
+         "textBaseline": "middle"
+        },
+        "rotation": {
+         "mode": "fixed",
+         "fixed": 0
+        }
+       }
+      }
+     }
+    ]
+   },
+   "description": "Newest cell-tower geolocation per device (cloud/geolocation: Google's position for the serving cell, so a device sits at its tower, within accuracy_m). Colour: time since the device last reported - green under 8 h, red past 14 h (two missed 6-hourly reports). Hover for the details."
+  },
+  {
+   "id": 11,
+   "type": "table",
+   "title": "Positions",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 31,
+    "w": 14,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select label as device, lat, lng, accuracy_m, tower, cell_id, cached, fix_at, on_tower_since\nfrom device_position join device_label using (device_id) where device_id in ($device) order by fix_at desc",
+     "format": "table",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "accuracy_m"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "lengthm"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "fix_at"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "on_tower_since"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "lat"
+      },
+      "properties": [
+       {
+        "id": "decimals",
+        "value": 5
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "lng"
+      },
+      "properties": [
+       {
+        "id": "decimals",
+        "value": 5
+       }
+      ]
+     }
+    ]
+   },
+   "options": {},
+   "description": "Latest fix per device. tower is mcc-mnc-lac-cid; on_tower_since is when the device last changed tower, so a stationary device shows its install date here."
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "Geolocation fixes per day",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "fleet-pg"
+   },
+   "gridPos": {
+    "x": 14,
+    "y": 31,
+    "w": 10,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "fleet-pg"
+     },
+     "refId": "A",
+     "rawQuery": true,
+     "rawSql": "select $__timeGroupAlias(ts, 1d),\n       case when cached then 'cached' else 'google lookup' end as metric, count(*)\nfrom geolocation where $__timeFilter(ts) and device_id in ($device) group by 1, 2 order by 1",
+     "format": "time_series",
+     "editorMode": "code"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "bars",
+      "fillOpacity": 70,
+      "stacking": {
+       "mode": "normal"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "Every connection yields one fix; 'google lookup' is a tower the device had not seen before (or one older than 90 days) - that is what costs a Geolocation API call."
+  },
+  {
+   "id": 13,
+   "type": "row",
+   "title": "Connectivity",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 39,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 14,
    "type": "state-timeline",
    "title": "Online / offline",
    "datasource": {
@@ -788,7 +1202,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 17,
+    "y": 40,
     "w": 24,
     "h": 9
    },
@@ -864,7 +1278,7 @@
    "description": "spark/status events. Devices sleep between reports, so 'offline' is the normal resting state; what matters is the cadence."
   },
   {
-   "id": 11,
+   "id": 15,
    "type": "timeseries",
    "title": "RSRP (Device OS diagnostics)",
    "datasource": {
@@ -873,7 +1287,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 26,
+    "y": 49,
     "w": 12,
     "h": 8
    },
@@ -918,7 +1332,7 @@
    "description": "Serving-cell RSRP as reported at each cloud handshake. Below about -110 dBm Cat-M1 attach gets slow."
   },
   {
-   "id": 12,
+   "id": 16,
    "type": "timeseries",
    "title": "SINR (rf_survey)",
    "datasource": {
@@ -927,7 +1341,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 26,
+    "y": 49,
     "w": 12,
     "h": 8
    },
@@ -971,7 +1385,7 @@
    }
   },
   {
-   "id": 13,
+   "id": 17,
    "type": "timeseries",
    "title": "Attach time per cycle (Δ modemSearchSec)",
    "datasource": {
@@ -980,7 +1394,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 34,
+    "y": 57,
     "w": 12,
     "h": 8
    },
@@ -1022,7 +1436,7 @@
    "description": "Seconds the modem spent searching for a network in each wake cycle. modemSearchSec is a lifetime counter; this is its difference between consecutive reports (null across a reboot)."
   },
   {
-   "id": 14,
+   "id": 18,
    "type": "timeseries",
    "title": "Connect failures per hour",
    "datasource": {
@@ -1031,7 +1445,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 34,
+    "y": 57,
     "w": 12,
     "h": 8
    },
@@ -1073,7 +1487,7 @@
    }
   },
   {
-   "id": 15,
+   "id": 19,
    "type": "table",
    "title": "Recent connect failures",
    "datasource": {
@@ -1082,7 +1496,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 42,
+    "y": 65,
     "w": 24,
     "h": 8
    },
@@ -1164,20 +1578,20 @@
    "description": "AT dump captured when the connect budget ran out, taken apart: CEER is the modem's reject cause, CGATT 0 = never attached, and band/cell/RSRP are what it was camped on at that moment (empty = no cell at all)."
   },
   {
-   "id": 16,
+   "id": 20,
    "type": "row",
    "title": "Radio",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 50,
+    "y": 73,
     "w": 24,
     "h": 1
    },
    "panels": []
   },
   {
-   "id": 17,
+   "id": 21,
    "type": "state-timeline",
    "title": "Serving cell",
    "datasource": {
@@ -1186,7 +1600,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 51,
+    "y": 74,
     "w": 12,
     "h": 9
    },
@@ -1243,7 +1657,7 @@
    "description": "TAC / E-UTRAN cell id the device attached through, per report. A colour change is a different cell; the same eNodeB with another sector differs only in the last two hex digits."
   },
   {
-   "id": 18,
+   "id": 22,
    "type": "state-timeline",
    "title": "Band",
    "datasource": {
@@ -1252,7 +1666,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 51,
+    "y": 74,
     "w": 12,
     "h": 9
    },
@@ -1309,7 +1723,7 @@
    "description": "LTE band and downlink centre frequency (from the EARFCN) per report."
   },
   {
-   "id": 19,
+   "id": 23,
    "type": "table",
    "title": "Cells seen",
    "datasource": {
@@ -1318,7 +1732,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 60,
+    "y": 83,
     "w": 24,
     "h": 9
    },
@@ -1505,7 +1919,7 @@
    "description": "Every cell the selected devices attached through in the time range, with how often and how well. rsrp_dbm/sinr are averages over those connections."
   },
   {
-   "id": 20,
+   "id": 24,
    "type": "timeseries",
    "title": "Connections per cell, per day",
    "datasource": {
@@ -1514,7 +1928,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 69,
+    "y": 92,
     "w": 12,
     "h": 8
    },
@@ -1557,7 +1971,7 @@
    "description": "How the selected devices' connections split across cells, day by day."
   },
   {
-   "id": 21,
+   "id": 25,
    "type": "timeseries",
    "title": "RSRP by band",
    "datasource": {
@@ -1566,7 +1980,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 69,
+    "y": 92,
     "w": 12,
     "h": 8
    },
@@ -1608,7 +2022,7 @@
    "description": "Every connection's RSRP, coloured by band. Shows whether the modem's band choice is costing signal."
   },
   {
-   "id": 22,
+   "id": 26,
    "type": "table",
    "title": "Connections",
    "datasource": {
@@ -1617,7 +2031,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 77,
+    "y": 100,
     "w": 24,
     "h": 10
    },
@@ -1820,20 +2234,20 @@
    "description": "One row per report: serving cell and frequency from the modem's +UCGED, operator and the OS's own RSRP from the diagnostics of the same wake cycle. Newest 1000 in the range."
   },
   {
-   "id": 23,
+   "id": 27,
    "type": "row",
    "title": "Power",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 87,
+    "y": 110,
     "w": 24,
     "h": 1
    },
    "panels": []
   },
   {
-   "id": 24,
+   "id": 28,
    "type": "timeseries",
    "title": "Battery",
    "datasource": {
@@ -1842,7 +2256,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 88,
+    "y": 111,
     "w": 12,
     "h": 8
    },
@@ -1888,7 +2302,7 @@
    }
   },
   {
-   "id": 25,
+   "id": 29,
    "type": "timeseries",
    "title": "Battery voltage (idle)",
    "datasource": {
@@ -1897,7 +2311,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 88,
+    "y": 111,
     "w": 12,
     "h": 8
    },
@@ -1942,20 +2356,20 @@
    }
   },
   {
-   "id": 26,
+   "id": 30,
    "type": "row",
    "title": "Backend",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 96,
+    "y": 119,
     "w": 24,
     "h": 1
    },
    "panels": []
   },
   {
-   "id": 27,
+   "id": 31,
    "type": "timeseries",
    "title": "Webhook errors per hour, by cause",
    "datasource": {
@@ -1964,7 +2378,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 97,
+    "y": 120,
     "w": 12,
     "h": 8
    },
@@ -2007,7 +2421,7 @@
    "description": "hook-error events grouped by the host (or Particle's own message) that produced them."
   },
   {
-   "id": 28,
+   "id": 32,
    "type": "timeseries",
    "title": "Webhook deliveries per hour",
    "datasource": {
@@ -2016,7 +2430,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 97,
+    "y": 120,
     "w": 12,
     "h": 8
    },
@@ -2060,7 +2474,7 @@
    "description": "For the telemetry hook: sent vs. response (delivered) vs. error. sent counts every configured integration, so it is a multiple of the telemetry rows."
   },
   {
-   "id": 29,
+   "id": 33,
    "type": "table",
    "title": "Firmware versions",
    "datasource": {
@@ -2069,7 +2483,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 105,
+    "y": 128,
     "w": 12,
     "h": 6
    },
@@ -2093,7 +2507,7 @@
    "options": {}
   },
   {
-   "id": 30,
+   "id": 34,
    "type": "table",
    "title": "Resets & flashes",
    "datasource": {
@@ -2102,7 +2516,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 105,
+    "y": 128,
     "w": 12,
     "h": 6
    },
