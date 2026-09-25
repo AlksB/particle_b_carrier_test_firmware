@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 39;
+const int FIRMWARE_VERSION = 40;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -268,22 +268,45 @@ static float readBatteryVoltage() {
 // board", with the divider, boost-converter load profile and reporting duty
 // cycle all baked in, rather than quoting a datasheet cell.
 //
-// Input must be vBatLoad (sampled while the modem is up and drawing): the
-// calibration run logged that reading, and publishTelemetry() feeds it here.
+// Input is vBatIdle - sampled at the top of a wake, before Particle.connect(),
+// with the modem off. It used to be vBatLoad, and that was wrong for a reason
+// this dataset shows plainly: a loaded reading is the cell's open-circuit
+// voltage minus I*R, and R moves with temperature and with depth of
+// discharge, so the same state of charge reads differently on a cold night
+// than on a warm afternoon. Sag across the fleet spans 83-239mV between
+// devices at the same health, and on 002's last day it ran 619-1232mV against
+// the 90-130mV it had shown all week. A gauge reading through that is reading
+// the resistance, not the charge.
 //
-// The chemistry caps accuracy at the top. A fresh pack sags from 6.4V to
-// ~5.72V within the first half hour, then *recovers* to ~5.81V and only
-// passes 5.72V again near 40% - so any reading in the 5.70-5.81V band is
-// ambiguous between ~95% and ~40%, and the table resolves it with the median
-// (most samples at those voltages were mid-life). That ambiguity is why this
-// function is no longer called directly for telemetry: above 5.68V
-// batteryPercentEstimate() ignores this table entirely and counts the
-// modem's charge instead, which does distinguish the two ends of the band.
-// Below ~5.6V the curve steepens and voltage alone is within a couple of
-// percent of truth, and that is the region this table is kept for.
+// Rebuilt from 002's pack, the only one in the log that genuinely ran to
+// nothing - 2295 reports from 2026-09-01 to 09-09, ending at 3.221V loaded /
+// 4.256V idle. The percentage axis is the charge still to be delivered before
+// that death, integrated from the modem phase counters, divided by the pack
+// total. That total is measured rather than assumed: 002's second pack spends
+// 17mAh getting from fresh (6.467V idle) down to where the first pack's
+// record opens (5.944V), and the first pack then delivered 1490mAh from there
+// to the end - 1506mAh in all, against the 1500 PACK_CAPACITY_MAH assumes.
+// Because the axis is normalised to that total, any common error in the phase
+// currents cancels; only the ratios between them matter, and those came from
+// the PPK captures.
 //
-// The pack died within an hour of reporting 2.96V, so the 2.90V floor is the
-// real cliff edge, not a theoretical cell cutoff.
+// 010 and 021 are not in the fit. 021 never ran a pack down - it went silent
+// at 5.488V idle with a fifth left. 010's first pack stopped at 4.641V idle,
+// which is where it went quiet, not necessarily where it was empty, so
+// anchoring 0% there would compress everything below it. Pooling all three
+// produced a curve that was not even monotonic.
+//
+// What the table cannot do is the plateau, and switching to idle voltage does
+// not change that. Between 5.944V and 5.874V idle - seventy millivolts - this
+// pack delivered 930mAh. No voltage gauge resolves that, which is why
+// AMBIGUOUS_BAND_LOW_V hands everything above it to the charge count. The
+// entries above 5.80V here exist only so the function stays monotonic if it
+// is ever called up there; they are not a measurement.
+//
+// The bottom is a cliff rather than a slope. 002 read 5.076V idle and then
+// 4.360V thirty-two seconds later, so 0% sits at 5.05V: below that the pack
+// has under a minute left, and the entries beneath are there to keep the
+// interpolation defined, not to describe a usable state.
 static int batteryPercentFromVoltage(float vbat) {
   // Pack voltage of 2xCR123A in series, exactly as readBatteryVoltage()
   // reports it - the calibration was done on the assembled pack, so per-cell
@@ -293,30 +316,30 @@ static int batteryPercentFromVoltage(float vbat) {
     uint8_t percent;
   };
   static const CurvePoint CURVE[] = {
-      {6.40f, 100},
+      // Guards only. The plateau swallows 930mAh in the 70mV under 5.94V, so
+      // nothing here is a reading - the charge count owns this region.
+      {6.50f, 100},
       {5.90f, 99},
-      // fresh-sag/recovery ambiguity band: median-of-samples mapping
-      {5.80f, 72},
-      {5.75f, 64},
-      {5.70f, 41},
-      // steady decline - this is where the estimate is trustworthy
-      {5.65f, 35},
-      {5.60f, 30},
-      {5.50f, 25},
-      {5.40f, 20},
-      {5.30f, 16},
-      {5.20f, 13},
-      {5.10f, 11},
-      {5.00f, 10},
-      {4.90f, 8},
-      {4.75f, 7},
-      {4.60f, 6},
-      {4.45f, 5},
-      {4.30f, 4},
-      {4.05f, 3},
-      {3.75f, 2},
-      {3.30f, 1},
-      {2.90f, 0},
+      // Measured from here down: 20mV bins, median of 002's samples in each,
+      // forced monotonic from the top.
+      {5.80f, 31},
+      {5.78f, 26},
+      {5.74f, 24},
+      {5.72f, 21},
+      {5.70f, 18},
+      {5.66f, 17},
+      {5.62f, 15},
+      {5.58f, 13},
+      {5.56f, 11},
+      {5.52f, 9},
+      {5.48f, 7},
+      {5.42f, 5},
+      {5.34f, 4},
+      {5.24f, 2},
+      {5.16f, 1},
+      // The cliff: 5.076V to 4.360V took thirty-two seconds.
+      {5.05f, 0},
+      {4.20f, 0},
   };
   const size_t COUNT = sizeof(CURVE) / sizeof(CURVE[0]);
 
@@ -433,7 +456,11 @@ static int batteryPercentEstimate(float vbat, uint64_t searchMs,
   // The sleeping board, measured. Charged against wall-clock time, not
   // modem time - it is drawn whether or not the modem ever came on.
   static const float SLEEP_MA = 0.060f;
-  static const float AMBIGUOUS_BAND_LOW_V = 5.68f;
+  // In idle volts now, not loaded. 5.68 loaded was roughly 5.78-5.81 idle at
+  // the 90-130mV sag a healthy pack shows, and 5.80 is also where the curve
+  // above stops carrying information, so the two agree on where the charge
+  // count has to take over.
+  static const float AMBIGUOUS_BAND_LOW_V = 5.80f;
 
   if (vbat < AMBIGUOUS_BAND_LOW_V) {
     return batteryPercentFromVoltage(vbat);
@@ -1240,8 +1267,11 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   // which is what the idle term in batteryPercentEstimate() is charged for.
   // Seconds in 32 bits covers longer than any pack will last.
   uint32_t packElapsedSec = (uint32_t)(g_packElapsedMs / 1000);
+  // vBatIdle, not vBatLoad - see batteryPercentFromVoltage(). vBatLoad still
+  // goes out in the payload; it is the better record of what the radio does
+  // to the pack, it is just not what a gauge should read.
   int batteryPercentage =
-      batteryPercentEstimate(vBatLoad, g_modemSearchMs, g_modemReadyMs,
+      batteryPercentEstimate(vBatIdle, g_modemSearchMs, g_modemReadyMs,
                              g_modemOffgoingMs, g_packElapsedMs);
   String payload = String::format(
       "{"
