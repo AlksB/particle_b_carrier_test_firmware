@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 40;
+const int FIRMWARE_VERSION = 41;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -564,6 +564,106 @@ static retained uint64_t g_modemOffgoingMs = 0; // detaching and powering down
 // report - a reset then costs one wake interval, not one telemetry period.
 static retained uint64_t g_packElapsedMs = 0;
 static uint64_t s_packElapsedMark = 0;
+
+// A copy of the pack-lifetime counters in EEPROM, because retained SRAM loses
+// them for two reasons that have nothing to do with the pack.
+//
+// The first is an update. Device OS keeps the user retained region only while
+// one magic word still reads 0x9A271C1E at the address the link gave it
+// (wiring/src/user.cpp:193). That word is itself `retained`, so it sits in
+// .retained_user beside everything here and moves whenever this file's
+// retained layout changes - add a counter or widen a buffer and the check
+// reads somewhere else, fails, and memcpy's the whole block back to its
+// initial values. Both things happened between v36 and v40, which is why
+// every field device reported 99% the morning after the v36 rollout while
+// sitting on a fortnight-old pack.
+//
+// The second is a brownout. 010 lost power at 19:58 on 2026-09-10, came back
+// on the same cells, and took 17 hours of counters with it - the stretch we
+// could only reconstruct afterwards from the charge balance.
+//
+// So the journal is the durable copy and retained is the working one. What it
+// must NOT do is outlive an actual battery change, because "on this pack" is
+// the whole meaning of these numbers. Power loss is no longer the test for
+// that - a brownout looks identical - so the pack's own voltage is: fresh
+// cells read 6.28-6.57V idle where a used pack reads 4.2-5.9, and the three
+// swaps in the log jumped 1.1V, 1.7V and 2.2V while the mid-pack power cut
+// moved 0.06V the wrong way. NEW_PACK_JUMP_V sits well inside that gap.
+struct PackJournal {
+  uint32_t magic;
+  uint32_t attempts;
+  uint32_t successes;
+  uint64_t searchMs;
+  uint64_t readyMs;
+  uint64_t offgoingMs;
+  uint64_t elapsedMs;
+  float vIdle; // last idle reading seen, so a pack change can be spotted
+  uint32_t sum; // plain additive checksum - a torn write must not restore
+};
+static const uint32_t PACK_JOURNAL_MAGIC = 0x5041434Bu; // 'PACK'
+static const int PACK_JOURNAL_ADDR = 0;
+static const float NEW_PACK_JUMP_V = 0.25f;
+// littlefs rewrites the backing file on every put, so the journal is written
+// at most this often rather than once per report. Losing the last few minutes
+// of counters to an update is not worth the flash wear: at the 3-minute
+// cadence a bench device would otherwise write 480 times a day.
+static const unsigned long PACK_JOURNAL_MIN_INTERVAL_MS = 60UL * 60 * 1000;
+
+static uint32_t packJournalSum(const PackJournal &j) {
+  const uint8_t *p = (const uint8_t *)&j;
+  uint32_t acc = 0;
+  for (size_t i = 0; i < offsetof(PackJournal, sum); i++) {
+    acc = acc * 31u + p[i];
+  }
+  return acc;
+}
+
+static void packJournalWrite(float vIdle) {
+  PackJournal j = {};
+  j.magic = PACK_JOURNAL_MAGIC;
+  j.attempts = g_cloudConnectAttemptsCount;
+  j.successes = g_cloudConnectSuccesses;
+  j.searchMs = g_modemSearchMs;
+  j.readyMs = g_modemReadyMs;
+  j.offgoingMs = g_modemOffgoingMs;
+  j.elapsedMs = g_packElapsedMs;
+  j.vIdle = vIdle;
+  j.sum = packJournalSum(j);
+  EEPROM.put(PACK_JOURNAL_ADDR, j);
+}
+
+// Called from setup() when Device OS reports the retained region did not
+// survive. Either an update moved the layout out from under it or the board
+// lost power; the voltage decides which, and only a genuinely fresh pack
+// starts the counters over.
+static void packJournalRestore(float vIdle) {
+  PackJournal j = {};
+  EEPROM.get(PACK_JOURNAL_ADDR, j);
+  if (j.magic != PACK_JOURNAL_MAGIC || j.sum != packJournalSum(j)) {
+    Log.info("pack journal: none (magic=%08lx) - starting this pack at zero",
+             (unsigned long)j.magic);
+    packJournalWrite(vIdle);
+    return;
+  }
+  if (vIdle > j.vIdle + NEW_PACK_JUMP_V) {
+    Log.info("pack journal: %.3fV against %.3fV stored - new cells, counters "
+             "stay at zero",
+             vIdle, j.vIdle);
+    packJournalWrite(vIdle);
+    return;
+  }
+  g_cloudConnectAttemptsCount = j.attempts;
+  g_cloudConnectSuccesses = j.successes;
+  g_modemSearchMs = j.searchMs;
+  g_modemReadyMs = j.readyMs;
+  g_modemOffgoingMs = j.offgoingMs;
+  g_packElapsedMs = j.elapsedMs;
+  Log.info("pack journal: restored %lu attempts, search=%lu ready=%lu "
+           "offgoing=%lu elapsed=%lu ms (stored at %.3fV, now %.3fV)",
+           (unsigned long)j.attempts, (unsigned long)j.searchMs,
+           (unsigned long)j.readyMs, (unsigned long)j.offgoingMs,
+           (unsigned long)j.elapsedMs, j.vIdle, vIdle);
+}
 
 // Folds the time since the last call into g_packElapsedMs. Cheap and
 // idempotent, so it can be called from anywhere that is about to read the
@@ -1267,6 +1367,15 @@ static bool publishTelemetry(bool reedClosed, float vBatLoad, float vBatIdle,
   // which is what the idle term in batteryPercentEstimate() is charged for.
   // Seconds in 32 bits covers longer than any pack will last.
   uint32_t packElapsedSec = (uint32_t)(g_packElapsedMs / 1000);
+  // Durable copy, at most hourly - see PackJournal. vBatIdle is what goes in
+  // it because that is what the pack-change test compares against on the next
+  // cold boot.
+  static unsigned long journalledAt = 0;
+  if (journalledAt == 0 ||
+      millis() - journalledAt >= PACK_JOURNAL_MIN_INTERVAL_MS) {
+    packJournalWrite(vBatIdle);
+    journalledAt = millis();
+  }
   // vBatIdle, not vBatLoad - see batteryPercentFromVoltage(). vBatLoad still
   // goes out in the payload; it is the better record of what the radio does
   // to the pack, it is just not what a gauge should read.
@@ -2082,6 +2191,13 @@ void setup() {
 
   System.on(firmware_update, firmwareUpdateHandler);
   System.on(network_status, networkStatusHandler);
+
+  // Before anything reads the counters. FEATURE_WARM_START is Device OS
+  // reporting __backup_ram_was_valid() - false means the retained region was
+  // re-initialised on this boot, which is the only case the journal is for.
+  if (!System.featureEnabled(FEATURE_WARM_START)) {
+    packJournalRestore(readBatteryVoltage());
+  }
 
   // No pull between polls - readReedIsClosed() enables it around each sample
   // and takes it back off (see REED_PIN).
