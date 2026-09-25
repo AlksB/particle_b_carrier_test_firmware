@@ -15,7 +15,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // you cut a release, so the console's Firmware/Releases feature and git
 // history both have a matching number. GIT_COMMIT_SHA (logged/published at
 // boot, below) pins the exact commit unambiguously either way.
-const int FIRMWARE_VERSION = 38;
+const int FIRMWARE_VERSION = 39;
 PRODUCT_VERSION(FIRMWARE_VERSION)
 
 // Run the application and system concurrently in separate threads
@@ -1394,7 +1394,14 @@ struct ConnectFailure {
   // to list costs another ~65, so a module carrying four of them is where
   // this buffer starts truncating from the tail. 384 was 8 bytes short of
   // the worst case even before those two probes existed.
-  char raw[512];
+  //
+  // 512 -> 576 when CIMI and the ESM follow-up below were added: those
+  // three extra replies measure ~90 characters together, and the longest
+  // record actually observed across 266 captures was 388, so 512 would
+  // have left ~35 bytes of margin where the original sizing deliberately
+  // kept ~120. Four records of 592 still fit the 3K of user backup RAM
+  // (2368 of it, against 317 for everything else retained).
+  char raw[576];
 };
 
 // Four is two days of backlog at the failure rate that prompted this (about
@@ -1502,11 +1509,62 @@ static retained uint8_t g_failureCount = 0;
 // matches on <MNO> where the value actually applied may be <MNO_detected> -
 // the raw reply shows both, and UBANDMASK beside it says whether the mask is
 // the intended 0,6170,0 or the factory 14-band default.
+//
+// CIMI is here for the carrier, not for us: every question about why a
+// subscription was refused begins with the IMSI, and until now no record
+// carried one, so a support ticket had to name the device and let them do
+// the lookup. It is a local read of the SIM, so it costs a UART round-trip.
 static const char *const FAILURE_PROBES[] = {
     "AT+COPS?\r\n",      "AT+UCGED?\r\n",     "AT+CGATT?\r\n",
-    "AT+CGACT?\r\n",     "AT+CPIN?\r\n",      "AT+UMNOPROF?\r\n",
-    "AT+UBANDMASK?\r\n", "AT+CGDCONT?\r\n",   "AT+CEER\r\n",
+    "AT+CGACT?\r\n",     "AT+CPIN?\r\n",      "AT+CIMI\r\n",
+    "AT+UMNOPROF?\r\n",  "AT+UBANDMASK?\r\n", "AT+CGDCONT?\r\n",
+    "AT+CEER\r\n",
 };
+
+// The ESM follow-up, run only when the passive pass came back with EMM
+// cause 19.
+//
+// EMM 19 means the network took the mobility half of the attach and refused
+// the session half. On LTE the PDN CONNECTIVITY REQUEST rides piggy-backed
+// inside the ATTACH REQUEST, so the reason lives in an ESM cause inside the
+// attach reject, and +CEER answers from whichever layer failed last - which
+// at that moment is EMM. That is why all 102 of our EMM 19 records say
+// "ESM failure" and stop.
+//
+// The module can say more. Its +CEER <type> is one of a documented set, and
+// four of them are session-layer: "SM attach error", "SM activation error",
+// "ESM attach error" and "ESM detach", each carrying a <cause> number and an
+// <error_description> string, both mandatory in the response on SARA-R5.
+// The manual scopes the command to "the last unsuccessful GPRS attach / EPS
+// bearer establishment or unsuccessful PDP context activation", so a bearer
+// that is refused on its own does get reported - it just has to be the last
+// thing that failed.
+//
+// Hence the order here: attach first, and only if that succeeds ask for the
+// context as a separate transaction. A rejection then is a standalone PDN
+// CONNECTIVITY REJECT, and the +CEER that follows should come back as one of
+// the SM/ESM types with the number we have never managed to see.
+//
+// When the attach itself is what the network refuses - +CGATT: 0 in the
+// passive pass, which is the usual case - this learns nothing and the second
+// +CEER repeats EMM 19. It pays off on the other case: the attach goes
+// through on a retry (004 did exactly that sixteen minutes after a refusal on
+// 2026-09-14) and the context is what gets denied.
+//
+// Gated on EMM 19 because that is the only cause it can add to, and it runs
+// at the end of a cycle that has already overspent and is about to power the
+// modem down regardless.
+static const char *const FAILURE_ESM_PROBES[] = {
+    "AT+CGATT=1\r\n",
+    "AT+CGACT=1,1\r\n",
+    "AT+CEER\r\n",
+};
+
+// These two reach for the network, unlike everything in FAILURE_PROBES, so
+// they get their own ceiling. 30s rather than the 75s an attach is allowed:
+// past that it is not going to answer differently, and every second here is
+// search current on a device that has already failed.
+const unsigned long FAILURE_ESM_TIMEOUT_MS = 30UL * 1000;
 
 // Per-probe ceiling. Every one of these is a local query - none reaches for
 // the network - so the reply is a UART round-trip and this is never
@@ -1581,6 +1639,31 @@ static void captureConnectFailure(unsigned long attemptMs) {
   entry->searchSec = (uint16_t)(attemptMs / 1000);
   entry->raw[0] = '\0';
 
+  // Close the search phase here rather than letting it run to Cellular.off().
+  //
+  // Everything below is diagnostics, not an attempt to connect, and the phase
+  // timers feed the charge model and every duty figure we reason with. Left
+  // in MODEM_SEARCH the probes bill themselves as radio work: the passive pass
+  // alone is up to 27s, and the ESM follow-up takes it to ~90s, against a
+  // 60s connect budget. A failed cycle would report more diagnostics than
+  // attempt.
+  //
+  // MODEM_OFFGOING is not a perfect name for it - the modem is idling on the
+  // AT interface, not detaching - but of the three buckets it is the honest
+  // one: this is the teardown, and it is the phase sleepWithCellularOff()
+  // would move to a second later anyway, at a current (53mA) close to what a
+  // modem answering local queries actually draws. The alternative was to keep
+  // calling it search at 46mA, which is the same arithmetic with a wrong
+  // label.
+  //
+  // Note for anyone comparing counters across firmware: from v39 on, the
+  // capture and the Particle.disconnect() that follows land in offgoing.
+  // Before it they were in search, which is part of why a v35 failure showed
+  // ~215s of "search" against a 120s budget.
+  if (s_modemPhase != MODEM_OFF) {
+    modemPhaseSet(System.millis(), MODEM_OFFGOING, "failure capture");
+  }
+
   RawCapture cap = {entry->raw, sizeof(entry->raw), 0};
 
   // One bare AT before the seven below. Each of those has a 3s ceiling and a
@@ -1615,6 +1698,49 @@ static void captureConnectFailure(unsigned long attemptMs) {
       // would shift a probe to the left.
       if (cap.len == before) {
         appendMarker(&cap, res == RESP_OK ? "ok" : (res == WAIT ? "x" : "err"));
+      }
+    }
+
+    // See FAILURE_ESM_PROBES. Matched against the rewritten text, where
+    // rawCaptureCallback() has already turned the modem's double quotes into
+    // single ones.
+    // Both halves of the gate matter. The cause text alone is not enough:
+    // +CEER reports the last procedure that *failed*, which on a device that
+    // has since attached is stale - a record carrying 'EMM cause',11 next to
+    // +CGATT: 1 and an assigned address was what showed that. Firing on one
+    // of those would spend a minute of airtime re-attaching a modem that is
+    // already attached with a live context. +CGATT: 0 is what says the cause
+    // still describes the present.
+    if (strstr(entry->raw, "'EMM cause',19") &&
+        strstr(entry->raw, "+CGATT: 0")) {
+      bool attached = true;
+      for (size_t i = 0;
+           i < sizeof(FAILURE_ESM_PROBES) / sizeof(FAILURE_ESM_PROBES[0]);
+           i++) {
+        if (cap.len > 0 && cap.len + 1 < cap.cap) {
+          cap.buf[cap.len++] = ';';
+          cap.buf[cap.len] = '\0';
+        }
+        // No attach, no point asking for a context on top of it - but the
+        // field still has to be written. Skipping the iteration outright
+        // would leave two entries where the reader expects three and shift
+        // +CEER into the slot a parser reads as +CGACT, which is the same
+        // misalignment the ok/x/err markers exist to prevent above.
+        if (i == 1 && !attached) {
+          appendMarker(&cap, "skip");
+          continue;
+        }
+        const size_t before = cap.len;
+        const int res =
+            Cellular.command(rawCaptureCallback, &cap, FAILURE_ESM_TIMEOUT_MS,
+                             FAILURE_ESM_PROBES[i]);
+        if (cap.len == before) {
+          appendMarker(&cap,
+                       res == RESP_OK ? "ok" : (res == WAIT ? "x" : "err"));
+        }
+        if (i == 0) {
+          attached = (res == RESP_OK);
+        }
       }
     }
   }
